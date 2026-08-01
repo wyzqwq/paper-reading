@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M0 - arXiv CORS 实测</title>
+</head>
+<body>
+<h1>M0 - arXiv CORS 实测</h1>
+<p>临时验证页（M0）。浏览器默认样式，无视觉设计。打开后自动跑下列 fetch 并显示结果。</p>
+
+<h2>环境信息</h2>
+<pre id="env"></pre>
+
+<h2>测试结果</h2>
+<pre id="results"></pre>
+
+<p>
+  <button id="copy">复制结果（文本）</button>
+  <button id="rerun">重跑</button>
+</p>
+
+<script>
+// 用确定存在的 arXiv 论文：Attention Is All You Need (1706.03762)
+const ARXIV_ID = '1706.03762';
+const results = [];
+
+function log(line) {
+  results.push(line);
+  document.getElementById('results').textContent += line + '\n';
+}
+
+function showEnv() {
+  const env = {
+    origin: location.origin,
+    href: location.href,
+    userAgent: navigator.userAgent,
+    time: new Date().toISOString()
+  };
+  document.getElementById('env').textContent = JSON.stringify(env, null, 2);
+}
+
+async function runTest(name, url, options, expectRead) {
+  log('\n--- ' + name + ' ---');
+  log('URL: ' + url);
+  log('mode: ' + (options.mode || 'default'));
+  const t0 = performance.now();
+  try {
+    const res = await fetch(url, options);
+    const dt = Math.round(performance.now() - t0);
+    log('status: ' + res.status + ' ' + res.statusText);
+    log('type: ' + res.type);
+    log('ok: ' + res.ok);
+    let bodyInfo = '(未尝试读取)';
+    if (expectRead) {
+      try {
+        if (res.type === 'opaque') {
+          bodyInfo = 'opaque 响应，无法读取（符合 no-cors 预期）';
+        } else {
+          const text = await res.text();
+          const ct = res.headers.get('content-type') || '';
+          bodyInfo = '已读取 ' + text.length + ' 字符；content-type: ' + ct +
+                     '；前 120 字符: ' + text.slice(0, 120).replace(/\s+/g, ' ');
+        }
+      } catch (e) {
+        bodyInfo = '读取 body 失败: ' + e.name + ': ' + e.message;
+      }
+    }
+    log('body: ' + bodyInfo);
+    log('耗时: ' + dt + 'ms');
+    let verdict;
+    if (res.type === 'opaque') verdict = 'OPAQUE（响应不可读）';
+    else if (res.ok) verdict = 'PASS（可读取）';
+    else verdict = 'HTTP 非 2xx（status=' + res.status + '）';
+    log('结论: ' + verdict);
+  } catch (e) {
+    const dt2 = Math.round(performance.now() - t0);
+    log('抛错: ' + e.name + ': ' + e.message);
+    log('耗时: ' + dt2 + 'ms');
+    const hint = (e.name === 'TypeError') ? '很可能是 CORS 阻断或网络错误' : e.name;
+    log('结论: FAIL（' + hint + '）');
+  }
+}
+
+async function runAll() {
+  results.length = 0;
+  document.getElementById('results').textContent = '';
+  showEnv();
+  log('=== M0 arXiv CORS 实测 开始 ===');
+
+  // 测试 1：arXiv API 元数据（API 端点对照）
+  await runTest(
+    '测试1 arXiv API 元数据（API 端点对照）',
+    'https://export.arxiv.org/api/query?id_list=' + ARXIV_ID,
+    { mode: 'cors' },
+    true
+  );
+
+  // 测试 2：arXiv PDF，cors 模式（风险项，决定是否需要代理）
+  await runTest(
+    '测试2 arXiv PDF（cors 模式，风险项）',
+    'https://arxiv.org/pdf/' + ARXIV_ID,
+    { mode: 'cors' },
+    true
+  );
+
+  // 测试 3：arXiv PDF，no-cors 模式（演示 opaque，作对照说明）
+  await runTest(
+    '测试3 arXiv PDF（no-cors 模式，预期 opaque 不可读）',
+    'https://arxiv.org/pdf/' + ARXIV_ID,
+    { mode: 'no-cors' },
+    false
+  );
+
+  log('\n=== 实测结束 ===');
+  log('判读指引：');
+  log('- 测试1 PASS + 测试2 FAIL => arXiv PDF 端点 CORS 不放行，需代理或跳系统浏览器。');
+  log('- 测试1 PASS + 测试2 PASS => 可直接浏览器 fetch PDF，无需代理。');
+  log('- 测试1 也 FAIL => 网络或其它问题，先排查联网/防火墙。');
+  log('- 测试3 OPAQUE 属正常（no-cors 拿不到内容），仅作对照。');
+}
+
+function copyResults() {
+  const text = document.getElementById('env').textContent + '\n\n' +
+               document.getElementById('results').textContent;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(
+      () => alert('已复制到剪贴板，可直接粘贴给我。'),
+      () => fallbackCopy(text)
+    );
+  } else {
+    fallbackCopy(text);
+  }
+}
+
+function fallbackCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); alert('已复制（fallback）。'); }
+  catch (e) { alert('复制失败，请手动选中结果文本复制。'); }
+  ta.remove();
+}
+
+document.getElementById('copy').addEventListener('click', copyResults);
+document.getElementById('rerun').addEventListener('click', runAll);
+
+runAll();
+</script>
+</body>
+</html>

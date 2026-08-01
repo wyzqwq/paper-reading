@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# 日志
+logs/
+*.log
+
+# 编辑器 / 临时
+node_modules/
+*.swp
+.tmp/
+
+# 大体积生成物（默认不进 git；如需提交单独 force-add）
+# results/
