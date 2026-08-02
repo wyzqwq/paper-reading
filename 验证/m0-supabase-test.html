@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M0 - Supabase 连通性实测</title>
+</head>
+<body>
+<h1>M0 - Supabase 连通性实测</h1>
+<p>临时验证页（M0）。浏览器默认样式。把 Supabase Project URL 和 anon key 填进下面输入框（只在本机内存里用，不外发、不进文件），点"跑测试"。</p>
+
+<p>
+  Project URL：<input id="url" size="40" placeholder="https://xxxxxxxxx.supabase.co"><br>
+  anon key：<input id="key" size="60" placeholder="eyJ...（anon public）">
+</p>
+<p>
+  <button id="run">跑测试</button>
+  <button id="copy">复制结果（文本）</button>
+</p>
+
+<h2>环境信息</h2>
+<pre id="env"></pre>
+
+<h2>测试结果</h2>
+<pre id="results"></pre>
+
+<script>
+const results = [];
+function log(line) {
+  results.push(line);
+  document.getElementById('results').textContent += line + '\n';
+}
+
+async function runTest(name, url, headers) {
+  log('\n--- ' + name + ' ---');
+  log('URL: ' + url);
+  const t0 = performance.now();
+  try {
+    const res = await fetch(url, { mode: 'cors', headers });
+    const dt = Math.round(performance.now() - t0);
+    log('status: ' + res.status + ' ' + res.statusText);
+    log('type: ' + res.type);
+    let bodyInfo = '';
+    try {
+      const text = await res.text();
+      bodyInfo = '已读取 ' + text.length + ' 字符；前 300 字符: ' + text.slice(0, 300).replace(/\s+/g, ' ');
+    } catch (e) { bodyInfo = '读取 body 失败: ' + e.message; }
+    log('body: ' + bodyInfo);
+    log('耗时: ' + dt + 'ms');
+  } catch (e) {
+    const dt2 = Math.round(performance.now() - t0);
+    log('抛错: ' + e.name + ': ' + e.message);
+    log('耗时: ' + dt2 + 'ms');
+    log('结论: FAIL（' + (e.name === 'TypeError' ? '网络/CORS/URL 错' : e.name) + '）');
+    return;
+  }
+  log('结论: 见判读指引');
+}
+
+async function runAll() {
+  const url = document.getElementById('url').value.trim();
+  const key = document.getElementById('key').value.trim();
+  results.length = 0;
+  document.getElementById('results').textContent = '';
+  if (!url || !key) { log('请先填 Project URL 和 anon key。'); return; }
+  const masked = key.slice(0, 12) + '...' + key.slice(-4);
+  document.getElementById('env').textContent = JSON.stringify({
+    origin: location.origin,
+    href: location.href,
+    supabaseUrl: url,
+    keyMasked: masked,
+    time: new Date().toISOString()
+  }, null, 2);
+  log('=== M0 Supabase 连通性实测 开始 ===');
+  const base = url.replace(/\/$/, '');
+  const H = { apikey: key, Authorization: 'Bearer ' + key };
+
+  // 测试1：auth 健康检查
+  await runTest('测试1 Auth 健康（/auth/v1/health）', base + '/auth/v1/health', H);
+
+  // 测试2：REST 根（PostgREST OpenAPI）
+  await runTest('测试2 REST 根（/rest/v1/）', base + '/rest/v1/', H);
+
+  // 测试3：查一个不存在的表，预期干净的 PostgREST 错误（证明路由+RLS 通）
+  await runTest('测试3 查不存在的表（/rest/v1/__m0_probe__）', base + '/rest/v1/__m0_probe__?select=*&limit=1', H);
+
+  log('\n=== 实测结束 ===');
+  log('判读指引：');
+  log('- 测试1 200 + body 含 name/version/GoTrue => auth 连通，URL+key 有效。');
+  log('- 测试2 200 + body 是 OpenAPI/JSON => REST/PostgREST 可达。');
+  log('- 测试3 预期 404 + PostgREST 错误码（如 42P01 relation does not exist）=> 路由+RLS 生效；若 200 返回数据 => anon 能读不该读的表，需查 RLS。');
+  log('- 任一 TypeError => URL 错或网络/CORS 问题（Supabase 默认放行 CORS，多半是 URL 写错）。');
+}
+
+function copyResults() {
+  const text = document.getElementById('env').textContent + '\n\n' + document.getElementById('results').textContent;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => alert('已复制，可直接粘贴给我。'), () => fallbackCopy(text));
+  } else { fallbackCopy(text); }
+}
+function fallbackCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text; document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); alert('已复制（fallback）。'); }
+  catch (e) { alert('复制失败，手动选中结果文本复制。'); }
+  ta.remove();
+}
+
+document.getElementById('run').addEventListener('click', runAll);
+document.getElementById('copy').addEventListener('click', copyResults);
+</script>
+</body>
+</html>
