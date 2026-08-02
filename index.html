@@ -141,15 +141,35 @@
   }
   .reader-loading, .reader-error { color: var(--muted); text-align: center; padding: 40px 20px; font-size: 14px; }
   .reader-error { color: var(--danger); }
-  /* textLayer（M4）：透明文字层，盖在 canvas 上让文字可选/可高亮 */
+  /* textLayer（M4）：透明文字层，盖在 canvas 上让文字可选/可高亮。
+     pdf.js v6 的 bare TextLayer API 不注入 CSS（adoptedStyleSheets 为空），需宿主页提供官方
+     textLayer 规则：把 pdf.js 设到 span 上的 --font-height / --scale-x 转成 font-size / transform，
+     否则 span 用默认字号、无 transform -> 溢出容器被 overflow:hidden 裁掉 -> 高亮 mark 不可见。
+     规则取自 pdfjs-dist@6.2.108 web/pdf_viewer.css 的 .textLayer 块。 */
   .textLayer {
     position: absolute; left: 0; top: 0; overflow: hidden; line-height: 1;
     z-index: 2; opacity: 1; text-align: initial;
+    /* pdf.js v6 TextLayer 需要的 CSS 变量（--total-scale-factor 按 zoom 动态写，见 renderTextLayer） */
+    --scale-round-x: 1px; --scale-round-y: 1px;
+    --min-font-size: 1;
+    --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+    --min-font-size-inv: calc(1 / var(--min-font-size));
   }
   .textLayer span, .textLayer br {
     color: transparent; position: absolute; white-space: pre; cursor: text;
     transform-origin: 0% 0%;
+    -webkit-user-select: text; user-select: text;
   }
+  /* 叶子 span 的字号 / 缩放：pdf.js 在每个 span 上设 --font-height / --scale-x，靠这两条转成渲染 */
+  .textLayer > :not(.markedContent),
+  .textLayer .markedContent span:not(.markedContent) {
+    --font-height: 0;
+    font-size: calc(var(--text-scale-factor) * var(--font-height));
+    --scale-x: 1;
+    --rotate: 0deg;
+    transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+  }
+  .textLayer .markedContent { display: contents; }
   .textLayer ::selection { background: rgba(108,140,255,0.35); }
   .textLayer mark.hl {
     color: transparent; border-radius: 1px; padding: 0; cursor: pointer;
@@ -993,13 +1013,15 @@ async function renderPage(canvas) {
 // 渲染某页 textLayer（M4）：pdf.js v6 TextLayer，透明文字层供选中/高亮
 async function renderTextLayer(canvas, cssScale) {
   const rs = readerState;
+  if (!rs) return; // closeReader 后 pending renderPage 可能仍调用此函数，readerState 已 null（与 applyHighlights 守卫一致）
   const pageNum = canvas._pageNum;
   const page = canvas._page;
   const vpCss = page.getViewport({ scale: cssScale });
   const container = canvas._textLayerDiv;
   container.innerHTML = '';
-  container.style.width = Math.round(vpCss.width) + 'px';
-  container.style.height = Math.round(vpCss.height) + 'px';
+  // pdf.js v6 TextLayer 的 font-size/容器尺寸算式依赖 --total-scale-factor（= viewport.scale），
+  // 不设则 calc 失效、容器塌成 0×0 + overflow:hidden 把 span 全裁掉 -> 文字选不中
+  container.style.setProperty('--total-scale-factor', cssScale);
   let tc = rs.textContentCache[pageNum];
   if (!tc) {
     tc = await page.getTextContent();
@@ -1009,6 +1031,9 @@ async function renderTextLayer(canvas, cssScale) {
     textContentSource: tc, container, viewport: vpCss, textDivs: []
   });
   try { await tl.render(); } catch (e) { /* 缩放/关闭取消，忽略 */ }
+  // 显式覆盖容器尺寸：setLayerDimensions 用 round()（旧浏览器可能不支持），且确保与 canvas 像素对齐
+  container.style.width = Math.round(vpCss.width) + 'px';
+  container.style.height = Math.round(vpCss.height) + 'px';
   rs.textLayers[pageNum] = { layer: tl, container, textDivs: tl.textDivs || [] };
   canvas._tlScale = cssScale;
 }
@@ -1147,33 +1172,43 @@ function applyHighlights(pageNum) {
   for (const a of annos) wrapTextRange(pageEl, a.start_offset, a.end_offset, a);
 }
 
-// 把 [start,end) 字符范围包进 <mark>（用 TreeWalker 定位文本节点）
+// 把 [start,end) 字符范围包进 <mark>。按文本节点分段：每段各自 surroundContents 一个 mark
+// （同一 anno 的所有 mark 共享 data-annoId / 颜色 / 批注）。这样每个 mark 都留在各自 span 内，
+// 继承 span 的 font-size / transform（--font-height / --scale-x），跨 span / 跨行高亮也能渲染。
+// （旧实现跨节点时退回 extractContents+insertNode，会把 mark 插成 .textLayer 直接子节点，
+// 拿不到 span 上的 CSS 变量 -> font-size 塌 0、宽度 0 -> 视觉不可见。Bug C）
 function wrapTextRange(pageEl, start, end, anno) {
   if (end <= start) return false;
   const walker = document.createTreeWalker(pageEl, NodeFilter.SHOW_TEXT);
-  let cur = 0, node, startNode = null, startOff = 0, endNode = null, endOff = 0;
+  const segs = []; // [{node, localStart, localEnd}]，先收齐再包，避免包裹时改 DOM 影响遍历
+  let cur = 0, node;
   while ((node = walker.nextNode())) {
     const len = node.nodeValue.length;
-    if (!startNode && cur + len >= start) { startNode = node; startOff = start - cur; }
-    if (!endNode && cur + len >= end) { endNode = node; endOff = end - cur; }
+    if (cur + len <= start) { cur += len; continue; } // 该文本节点整体在 start 之前
+    if (cur >= end) break;                            // 该文本节点整体在 end 之后，后面更后
+    segs.push({ node, localStart: Math.max(0, start - cur), localEnd: Math.min(len, end - cur) });
     cur += len;
-    if (endNode) break;
   }
-  if (!startNode || !endNode) return false;
-  const range = document.createRange();
-  range.setStart(startNode, Math.max(0, startOff));
-  range.setEnd(endNode, Math.max(0, endOff));
-  const mark = document.createElement('mark');
-  mark.className = 'hl';
-  mark.dataset.annoId = anno.id;
-  mark.style.backgroundColor = HIGHLIGHT_COLORS[anno.color] || HIGHLIGHT_COLORS.yellow;
-  if (anno.note) mark.title = anno.note;
-  try { range.surroundContents(mark); return true; }
-  catch (e) {
-    // 跨节点（已有 mark）时 surroundContents 失败，退回 extract+wrap
-    try { const frag = range.extractContents(); mark.appendChild(frag); range.insertNode(mark); return true; }
-    catch (e2) { return false; }
+  if (segs.length === 0) return false;
+  let any = false;
+  for (const s of segs) {
+    if (s.localEnd <= s.localStart) continue;
+    const range = document.createRange();
+    range.setStart(s.node, s.localStart);
+    range.setEnd(s.node, s.localEnd);
+    const mark = document.createElement('mark');
+    mark.className = 'hl';
+    mark.dataset.annoId = anno.id;
+    mark.style.backgroundColor = HIGHLIGHT_COLORS[anno.color] || HIGHLIGHT_COLORS.yellow;
+    if (anno.note) mark.title = anno.note;
+    try { range.surroundContents(mark); any = true; }
+    catch (e) {
+      // 单文本节点内一般不会失败；边界处若已存在 mark 导致部分跨节点，退回 extract+insert
+      try { const frag = range.extractContents(); mark.appendChild(frag); range.insertNode(mark); any = true; }
+      catch (e2) { /* 跳过该段 */ }
+    }
   }
+  return any;
 }
 
 // 从当前 Selection 算出在 pageEl 文本里的 [start,end) 偏移（用 Range.toString().length）
