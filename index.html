@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1a1a2e">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="论文阅读">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<title>论文阅读</title>
+<style>
+  /* 占位深色主题（M7 定稿）。配色 token 暂定：bg #1a1a2e / text #d4d4e0 / accent #6c8cff */
+  :root {
+    --bg: #1a1a2e;
+    --surface: #242440;
+    --surface-2: #2c2c4f;
+    --text: #d4d4e0;
+    --muted: #8a8aa3;
+    --accent: #6c8cff;
+    --accent-h: #5a7ae8;
+    --border: #2e2e4f;
+    --danger: #e06c6c;
+    --radius: 8px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-size: 16px; line-height: 1.5;
+    max-width: 720px; margin: 0 auto;
+    padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+    -webkit-text-size-adjust: 100%;
+  }
+  header {
+    position: sticky; top: 0; background: var(--bg); z-index: 10;
+    border-bottom: 1px solid var(--border);
+    padding-top: env(safe-area-inset-top);
+  }
+  header h1 { margin: 0; padding: 14px 16px 6px; font-size: 18px; font-weight: 600; }
+  nav.tabs { display: flex; padding: 0 8px; }
+  nav.tabs button {
+    flex: 1; background: none; border: none; color: var(--muted);
+    padding: 10px 8px; font-size: 14px; cursor: pointer;
+    border-bottom: 2px solid transparent; border-radius: 0;
+  }
+  nav.tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+  main { padding: 12px 16px 80px; }
+  .empty { color: var(--muted); text-align: center; padding: 40px 16px; font-size: 14px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 12px 14px; margin-bottom: 10px;
+  }
+  .card .title { font-weight: 600; font-size: 15px; margin-bottom: 4px; }
+  .card .authors { color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+  .card .meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 12px; }
+  .badge { padding: 2px 8px; border-radius: 10px; font-size: 11px; }
+  .badge.status-want { background: #3a3a5f; color: var(--text); }
+  .badge.status-reading { background: #2d4a6e; color: #a8c4ff; }
+  .badge.status-done { background: #2d4e3a; color: #a8e8c4; }
+  .badge.status-abandoned { background: #4e2d2d; color: #e8a8a8; }
+  .tag { background: var(--surface-2); color: var(--muted); padding: 1px 6px; border-radius: 8px; font-size: 11px; }
+  .stars { color: var(--accent); letter-spacing: 1px; }
+  .card .url-line { margin-top: 6px; word-break: break-all; }
+  .card .actions { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .card .actions button {
+    background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+    padding: 4px 10px; border-radius: 6px; font-size: 12px; cursor: pointer;
+  }
+  .card .actions button:hover { background: var(--accent); color: #fff; }
+  .card .actions button.danger:hover { background: var(--danger); color: #fff; }
+  .fab {
+    position: fixed; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom));
+    width: 52px; height: 52px; border-radius: 50%; background: var(--accent); color: #fff;
+    border: none; font-size: 28px; line-height: 1; cursor: pointer;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4); z-index: 20;
+  }
+  .fab:hover { background: var(--accent-h); }
+  .overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 30;
+    display: none; align-items: flex-end; justify-content: center;
+  }
+  .overlay.show { display: flex; }
+  .modal {
+    background: var(--surface); width: 100%; max-width: 720px;
+    border-radius: var(--radius) var(--radius) 0 0; padding: 16px;
+    max-height: 92vh; overflow-y: auto;
+    padding-bottom: calc(16px + env(safe-area-inset-bottom));
+  }
+  .modal h2 { margin: 0 0 4px; font-size: 16px; }
+  .modal .hint { color: var(--muted); font-size: 12px; margin: 0 0 10px; }
+  .modal label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  .modal input, .modal textarea, .modal select {
+    width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 10px; font-size: 14px; font-family: inherit;
+  }
+  .modal textarea { min-height: 80px; resize: vertical; }
+  .modal .btns { display: flex; gap: 8px; margin-top: 16px; }
+  .modal .btns button { flex: 1; padding: 10px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  .btn-primary { background: var(--accent); color: #fff; border: none; }
+  .btn-primary:hover { background: var(--accent-h); }
+  .btn-secondary { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); }
+  .star-input { display: flex; align-items: center; gap: 2px; }
+  .star-input span.star { cursor: pointer; color: var(--muted); font-size: 20px; line-height: 1; }
+  .star-input span.star.on { color: var(--accent); }
+  .star-input .clr { font-size: 12px; color: var(--muted); margin-left: 8px; cursor: pointer; }
+  .url-link { color: var(--accent); text-decoration: none; font-size: 12px; }
+  .url-text { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>论文阅读</h1>
+  <nav class="tabs">
+    <button data-tab="feed">今日推荐</button>
+    <button data-tab="queue" class="active">阅读队列</button>
+    <button data-tab="archive">已读归档</button>
+  </nav>
+</header>
+
+<main>
+  <section id="tab-feed" class="tab-panel" style="display:none">
+    <div class="empty">日推功能将在 M5 开发（订阅 arXiv 分类、每日拉取、排序、加入想读/跳过）。当前请先用「阅读队列」手动管理论文。</div>
+  </section>
+  <section id="tab-queue" class="tab-panel">
+    <div id="list-queue"></div>
+  </section>
+  <section id="tab-archive" class="tab-panel" style="display:none">
+    <div id="list-archive"></div>
+  </section>
+</main>
+
+<button class="fab" id="add-btn" aria-label="新增论文">+</button>
+
+<div class="overlay" id="overlay">
+  <div class="modal" id="modal">
+    <h2 id="modal-title">新增论文</h2>
+    <p class="hint" id="modal-hint"></p>
+    <input type="hidden" id="f-id">
+    <label>标题 *</label>
+    <input id="f-title" placeholder="论文标题">
+    <label>作者（逗号分隔）</label>
+    <input id="f-authors" placeholder="Author A, Author B">
+    <label>来源</label>
+    <select id="f-source">
+      <option value="manual">手动录入</option>
+      <option value="url">URL（其它网站 PDF / 页面）</option>
+    </select>
+    <label>URL</label>
+    <input id="f-url" placeholder="https://...">
+    <label>摘要</label>
+    <textarea id="f-abstract" placeholder="摘要（可选）"></textarea>
+    <label>状态</label>
+    <select id="f-status">
+      <option value="want">想读</option>
+      <option value="reading">在读</option>
+      <option value="done">已读</option>
+      <option value="abandoned">弃读</option>
+    </select>
+    <label>评分</label>
+    <div class="star-input" id="f-rating">
+      <span class="star" data-v="1">★</span><span class="star" data-v="2">★</span><span class="star" data-v="3">★</span><span class="star" data-v="4">★</span><span class="star" data-v="5">★</span>
+      <span class="clr">清除</span>
+    </div>
+    <label>标签（逗号分隔）</label>
+    <input id="f-tags" placeholder="transformer, nlp">
+    <label>笔记（Markdown）</label>
+    <textarea id="f-notes" placeholder="阅读笔记..."></textarea>
+    <div class="btns">
+      <button class="btn-secondary" id="cancel-btn">取消</button>
+      <button class="btn-primary" id="save-btn">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ===== IndexedDB：papers store（字段按计划书 §4.1 子集；M1 只本地，M6 接 Supabase 同步）=====
+const DB_NAME = 'paper-reading';
+const DB_VERSION = 1;
+let db = null;
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const d = e.target.result;
+      if (!d.objectStoreNames.contains('papers')) {
+        const s = d.createObjectStore('papers', { keyPath: 'id' });
+        s.createIndex('status', 'status', { unique: false });
+        s.createIndex('updated_at', 'updated_at', { unique: false });
+      }
+    };
+    req.onsuccess = () => { db = req.result; resolve(db); };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function uid() {
+  // RFC4122 v4 近似（Math.random，非加密强度；M6 同步时如需可换 crypto.randomUUID）
+  if (crypto && crypto.randomUUID) return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = Math.random() * 16 | 0;
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
+
+function store(mode) { return db.transaction('papers', mode).objectStore('papers'); }
+
+function dbAll() {
+  return new Promise((resolve, reject) => {
+    const req = store('readonly').getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function dbPut(paper) {
+  return new Promise((resolve, reject) => {
+    const req = store('readwrite').put(paper);
+    req.onsuccess = () => resolve(paper);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function dbDelete(id) {
+  return new Promise((resolve, reject) => {
+    const req = store('readwrite').delete(id);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// ===== 模型 =====
+const STATUS_LABEL = { want: '想读', reading: '在读', done: '已读', abandoned: '弃读' };
+
+function nowISO() { return new Date().toISOString(); }
+
+function parseList(str) {
+  return (str || '').split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+// 评分输入的模块级状态（编辑器复用）
+let currentRating = 0;
+let editingId = null;     // 当前编辑条目 id；null=新增
+let editingPaper = null;  // 编辑时保留旧条目（保住 arxiv_id/local_file_path/read_progress/added_at）
+
+function makePaperFromForm() {
+  const existing = editingId ? (editingPaper || {}) : {};
+  return {
+    id: document.getElementById('f-id').value || uid(),
+    title: document.getElementById('f-title').value.trim(),
+    authors: parseList(document.getElementById('f-authors').value),
+    abstract: document.getElementById('f-abstract').value.trim() || null,
+    source_type: document.getElementById('f-source').value,
+    arxiv_id: existing.arxiv_id || null,
+    url: document.getElementById('f-url').value.trim() || null,
+    local_file_path: existing.local_file_path || null,
+    status: document.getElementById('f-status').value,
+    rating: currentRating || null,
+    tags: parseList(document.getElementById('f-tags').value),
+    notes_md: document.getElementById('f-notes').value,
+    read_progress: existing.read_progress || 0,
+    added_at: existing.added_at || nowISO(),
+    updated_at: nowISO()
+  };
+}
+
+// ===== 渲染 =====
+function stars(n) {
+  n = n || 0;
+  return '★★★★★'.slice(0, n) + '☆☆☆☆☆'.slice(0, 5 - n);
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
+
+function safeUrl(u) { return /^https?:\/\//i.test(u || ''); }
+
+function statusActions(status) {
+  // 全部状态可互转（计划书 §4.1：想读/在读/已读/弃读 全可逆）
+  const btns = [];
+  if (status !== 'reading') btns.push('<button data-status="reading">设为在读</button>');
+  if (status !== 'want') btns.push('<button data-status="want">设为想读</button>');
+  if (status !== 'done') btns.push('<button data-status="done">设为已读</button>');
+  if (status !== 'abandoned') btns.push('<button data-status="abandoned">弃读</button>');
+  return btns.join('');
+}
+
+function renderCard(p) {
+  const el = document.createElement('div');
+  el.className = 'card';
+  const tagsHtml = (p.tags || []).map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join('');
+  let urlHtml = '';
+  if (p.url) {
+    urlHtml = safeUrl(p.url)
+      ? `<div class="url-line"><a class="url-link" href="${escapeHtml(p.url)}" target="_blank" rel="noopener">${escapeHtml(p.url)}</a></div>`
+      : `<div class="url-line"><span class="url-text">${escapeHtml(p.url)}</span></div>`;
+  }
+  el.innerHTML =
+    `<div class="title">${escapeHtml(p.title)}</div>` +
+    `<div class="authors">${escapeHtml((p.authors || []).join(', '))}</div>` +
+    `<div class="meta">` +
+      `<span class="badge status-${p.status}">${STATUS_LABEL[p.status] || p.status}</span>` +
+      (p.rating ? `<span class="stars">${stars(p.rating)}</span>` : '') +
+      tagsHtml +
+    `</div>` +
+    urlHtml +
+    `<div class="actions">` +
+      `<button data-act="edit">编辑</button>` +
+      statusActions(p.status) +
+      `<button data-act="delete" class="danger">删除</button>` +
+    `</div>`;
+  el.querySelector('[data-act="edit"]').addEventListener('click', () => openEditor(p));
+  el.querySelector('[data-act="delete"]').addEventListener('click', () => del(p));
+  el.querySelectorAll('[data-status]').forEach((b) => {
+    b.addEventListener('click', () => changeStatus(p, b.dataset.status));
+  });
+  return el;
+}
+
+function sortPapers(list) {
+  // 在读优先，想读其次，已读/弃读最后；同状态按 updated_at 倒序
+  const rank = { reading: 0, want: 1, done: 2, abandoned: 3 };
+  return list.slice().sort((a, b) => {
+    if (rank[a.status] !== rank[b.status]) return rank[a.status] - rank[b.status];
+    return (b.updated_at || '').localeCompare(a.updated_at || '');
+  });
+}
+
+function renderList(elId, list) {
+  const el = document.getElementById(elId);
+  el.innerHTML = '';
+  if (list.length === 0) {
+    el.innerHTML = '<div class="empty">暂无条目</div>';
+    return;
+  }
+  list.forEach((p) => el.appendChild(renderCard(p)));
+}
+
+async function render() {
+  const all = await dbAll();
+  const queue = sortPapers(all.filter((p) => p.status === 'want' || p.status === 'reading'));
+  const archive = sortPapers(all.filter((p) => p.status === 'done' || p.status === 'abandoned'));
+  renderList('list-queue', queue);
+  renderList('list-archive', archive);
+}
+
+// ===== 编辑器 =====
+function renderStars() {
+  document.querySelectorAll('#f-rating span.star').forEach((s) => {
+    s.classList.toggle('on', Number(s.dataset.v) <= currentRating);
+  });
+}
+
+function openEditor(p) {
+  p = p || null;
+  editingId = p ? p.id : null;
+  editingPaper = p || null;
+  document.getElementById('modal-title').textContent = p ? '编辑论文' : '新增论文';
+  document.getElementById('modal-hint').textContent = p
+    ? '修改后保存即更新该条目。'
+    : '手动录入论文信息（arXiv 一键导入在 M3 上线）。';
+  document.getElementById('f-id').value = p ? p.id : '';
+  document.getElementById('f-title').value = p ? (p.title || '') : '';
+  document.getElementById('f-authors').value = p ? (p.authors || []).join(', ') : '';
+  document.getElementById('f-source').value = p ? (p.source_type || 'manual') : 'manual';
+  document.getElementById('f-url').value = p ? (p.url || '') : '';
+  document.getElementById('f-abstract').value = p ? (p.abstract || '') : '';
+  document.getElementById('f-status').value = p ? (p.status || 'want') : 'want';
+  document.getElementById('f-tags').value = p ? (p.tags || []).join(', ') : '';
+  document.getElementById('f-notes').value = p ? (p.notes_md || '') : '';
+  currentRating = p ? (p.rating || 0) : 0;
+  renderStars();
+  document.getElementById('overlay').classList.add('show');
+}
+
+function closeEditor() {
+  document.getElementById('overlay').classList.remove('show');
+}
+
+async function save() {
+  const paper = makePaperFromForm();
+  if (!paper.title) { alert('请填写标题'); return; }
+  try {
+    await dbPut(paper);
+    closeEditor();
+    render();
+  } catch (err) {
+    alert('保存失败：' + (err && err.message ? err.message : err));
+  }
+}
+
+async function del(p) {
+  if (!confirm(`删除「${p.title}」？此操作不可撤销。`)) return;
+  await dbDelete(p.id);
+  render();
+}
+
+async function changeStatus(p, status) {
+  p.status = status;
+  p.updated_at = nowISO();
+  await dbPut(p);
+  render();
+}
+
+// ===== 事件绑定 =====
+function switchTab(tab) {
+  document.querySelectorAll('nav.tabs button').forEach((x) => {
+    x.classList.toggle('active', x.dataset.tab === tab);
+  });
+  document.querySelectorAll('.tab-panel').forEach((p) => { p.style.display = 'none'; });
+  document.getElementById('tab-' + tab).style.display = '';
+}
+
+document.querySelectorAll('nav.tabs button').forEach((b) => {
+  b.addEventListener('click', () => switchTab(b.dataset.tab));
+});
+
+document.getElementById('add-btn').addEventListener('click', () => openEditor(null));
+document.getElementById('cancel-btn').addEventListener('click', closeEditor);
+document.getElementById('save-btn').addEventListener('click', save);
+document.getElementById('overlay').addEventListener('click', (e) => {
+  if (e.target.id === 'overlay') closeEditor();
+});
+
+document.querySelectorAll('#f-rating span.star').forEach((s) => {
+  s.addEventListener('click', () => { currentRating = Number(s.dataset.v); renderStars(); });
+});
+document.querySelector('#f-rating .clr').addEventListener('click', () => {
+  currentRating = 0; renderStars();
+});
+
+// ===== Service Worker 注册（M1 仅缓存 app 壳；更新提示留 M7）=====
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').catch((err) => console.warn('SW 注册失败:', err));
+  });
+}
+
+// ===== 启动 =====
+openDB()
+  .then(() => render())
+  .catch((err) => {
+    document.getElementById('list-queue').innerHTML =
+      `<div class="empty">数据库打开失败：${escapeHtml(err && err.message ? err.message : err)}</div>`;
+  });
+</script>
+</body>
+</html>
