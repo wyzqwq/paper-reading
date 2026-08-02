@@ -1,13 +1,15 @@
-// M1 Service Worker：缓存 app 壳。pdf.js / Supabase SDK 等 vendored 资源留 M2/M6。
+// M1 Service Worker：缓存 app 壳。pdf.js（M2 加入预缓存）；wasm/字体运行时缓存。
 // 更新提示（"有更新，点击刷新"）留 M7。
-const CACHE = 'paper-reading-v1';
+const CACHE = 'paper-reading-v2';
 const SHELL = [
   './',
   './index.html',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',
-  './icons/apple-touch-icon.png'
+  './icons/apple-touch-icon.png',
+  './vendor/pdfjs/pdf.min.mjs',
+  './vendor/pdfjs/pdf.worker.min.mjs'
 ];
 
 self.addEventListener('install', (e) => {

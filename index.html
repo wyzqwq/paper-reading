@@ -107,6 +107,38 @@
   .star-input .clr { font-size: 12px; color: var(--muted); margin-left: 8px; cursor: pointer; }
   .url-link { color: var(--accent); text-decoration: none; font-size: 12px; }
   .url-text { color: var(--muted); font-size: 12px; }
+  /* 阅读器（M2） */
+  .reader {
+    position: fixed; inset: 0; background: #2a2a3a; z-index: 40;
+    display: none; flex-direction: column;
+  }
+  .reader.show { display: flex; }
+  .reader-topbar {
+    display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+    background: var(--bg); border-bottom: 1px solid var(--border);
+    padding-top: calc(8px + env(safe-area-inset-top)); flex-shrink: 0;
+  }
+  .reader-topbar button {
+    background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 14px; line-height: 1;
+  }
+  .reader-topbar button:hover { background: var(--accent); color: #fff; }
+  .reader-close { font-size: 16px; }
+  .reader-pageinfo { font-size: 13px; color: var(--muted); min-width: 64px; text-align: center; }
+  .reader-progress { flex: 1; height: 6px; background: var(--surface-2); border-radius: 3px; overflow: hidden; }
+  .reader-progress > div { height: 100%; background: var(--accent); width: 0%; transition: width 0.1s; }
+  .reader-zoom { display: flex; gap: 4px; }
+  .reader-scroll {
+    flex: 1; overflow-y: auto; overflow-x: hidden; padding: 12px 0;
+    display: flex; flex-direction: column; align-items: center; gap: 12px;
+    -webkit-overflow-scrolling: touch;
+  }
+  .reader-page { display: flex; justify-content: center; }
+  .reader-page canvas {
+    display: block; background: #fff; box-shadow: 0 2px 12px rgba(0,0,0,0.5);
+  }
+  .reader-loading, .reader-error { color: var(--muted); text-align: center; padding: 40px 20px; font-size: 14px; }
+  .reader-error { color: var(--danger); }
 </style>
 </head>
 <body>
@@ -172,6 +204,19 @@
       <button class="btn-primary" id="save-btn">保存</button>
     </div>
   </div>
+</div>
+
+<div class="reader" id="reader">
+  <div class="reader-topbar">
+    <button class="reader-close" id="reader-close" aria-label="关闭阅读器">✕</button>
+    <span class="reader-pageinfo" id="reader-pageinfo"></span>
+    <div class="reader-progress"><div id="reader-progress-fill"></div></div>
+    <div class="reader-zoom">
+      <button id="reader-zoom-out" aria-label="缩小">−</button>
+      <button id="reader-zoom-in" aria-label="放大">＋</button>
+    </div>
+  </div>
+  <div class="reader-scroll" id="reader-scroll"></div>
 </div>
 
 <script>
@@ -310,12 +355,15 @@ function renderCard(p) {
     `</div>` +
     urlHtml +
     `<div class="actions">` +
+      (resolvePdfUrl(p) ? `<button data-act="read">阅读</button>` : '') +
       `<button data-act="edit">编辑</button>` +
       statusActions(p.status) +
       `<button data-act="delete" class="danger">删除</button>` +
     `</div>`;
   el.querySelector('[data-act="edit"]').addEventListener('click', () => openEditor(p));
   el.querySelector('[data-act="delete"]').addEventListener('click', () => del(p));
+  const readBtn = el.querySelector('[data-act="read"]');
+  if (readBtn) readBtn.addEventListener('click', () => openReader(p));
   el.querySelectorAll('[data-status]').forEach((b) => {
     b.addEventListener('click', () => changeStatus(p, b.dataset.status));
   });
@@ -433,6 +481,229 @@ document.querySelectorAll('#f-rating span.star').forEach((s) => {
 document.querySelector('#f-rating .clr').addEventListener('click', () => {
   currentRating = 0; renderStars();
 });
+
+// ===== 阅读器（M2：pdf.js 连续滚动 + 进度记忆）=====
+let pdfjsLib = null;
+let readerState = null;
+
+function resolvePdfUrl(p) {
+  let u = p && p.url;
+  if (!u) return null;
+  // arXiv abs/pdf 链接统一转 https://arxiv.org/pdf/<id>（M0 实测 arxiv PDF CORS 通，可直连）
+  const m = u.match(/arxiv\.org\/(?:abs|pdf)\/([0-9]{4}\.[0-9]+(?:v[0-9]+)?|[a-z.\-]+\/[0-9]{7}(?:v[0-9]+)?)/i);
+  if (m) return 'https://arxiv.org/pdf/' + m[1];
+  return u;
+}
+
+async function openReader(paper) {
+  const url = resolvePdfUrl(paper);
+  if (!url) { alert('该条目没有可加载的 PDF 链接（本地 PDF 导入在 M3 上线）。'); return; }
+  const overlay = document.getElementById('reader');
+  overlay.classList.add('show');
+  const scrollEl = document.getElementById('reader-scroll');
+  scrollEl.innerHTML = '<div class="reader-loading">加载中…</div>';
+  document.getElementById('reader-pageinfo').textContent = '';
+  document.getElementById('reader-progress-fill').style.width = '0%';
+
+  if (!pdfjsLib) {
+    try {
+      pdfjsLib = await import('./vendor/pdfjs/pdf.min.mjs');
+      pdfjsLib.GlobalWorkerOptions.workerSrc = './vendor/pdfjs/pdf.worker.min.mjs';
+    } catch (e) {
+      scrollEl.innerHTML = '<div class="reader-error">pdf.js 加载失败：' + escapeHtml(e && e.message || String(e)) + '</div>';
+      return;
+    }
+  }
+  // 取最新条目（用 DB 里的 read_progress 恢复，避免对象过期）
+  let p = paper;
+  try {
+    const all = await dbAll();
+    const fresh = all.find((x) => x.id === paper.id);
+    if (fresh) p = fresh;
+  } catch (e) { /* ignore */ }
+
+  readerState = {
+    paper: p, url, pdf: null, loadingTask: null, numPages: 0,
+    canvases: [], baseScale: 1, zoom: 1, dpr: window.devicePixelRatio || 1,
+    io: null, saveTimer: null, scrollEl, ready: false
+  };
+
+  try {
+    const task = pdfjsLib.getDocument({
+      url,
+      wasmUrl: './vendor/pdfjs/wasm/',
+      standardFontDataUrl: './vendor/pdfjs/standard_fonts/'
+    });
+    readerState.loadingTask = task;
+    const pdf = await task.promise;
+    readerState.pdf = pdf;
+    readerState.numPages = pdf.numPages;
+    await layoutPages();
+    readerState.ready = true;
+    setupReaderObserver();
+    restoreReaderProgress();
+    scrollEl.addEventListener('scroll', onReaderScroll, { passive: true });
+  } catch (e) {
+    scrollEl.innerHTML = '<div class="reader-error">PDF 加载失败：' +
+      escapeHtml(e && e.message || String(e)) +
+      '<br>可能链接非 PDF、网络问题或跨域限制。</div>';
+  }
+}
+
+async function layoutPages() {
+  const rs = readerState;
+  const scrollEl = rs.scrollEl;
+  scrollEl.innerHTML = '';
+  rs.canvases = [];
+  // 适配宽度算 baseScale（按第 1 页宽度），zoom 为倍数
+  const containerW = scrollEl.clientWidth - 24;
+  const page1 = await rs.pdf.getPage(1);
+  const vp1 = page1.getViewport({ scale: 1 });
+  rs.baseScale = containerW > 0 ? containerW / vp1.width : 1;
+  const scale = rs.baseScale * rs.zoom;
+  for (let i = 1; i <= rs.numPages; i++) {
+    const page = i === 1 ? page1 : await rs.pdf.getPage(i);
+    const vpRender = page.getViewport({ scale: scale * rs.dpr });
+    const vpCss = page.getViewport({ scale });
+    const div = document.createElement('div');
+    div.className = 'reader-page';
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(vpRender.width);
+    canvas.height = Math.ceil(vpRender.height);
+    canvas.style.width = Math.round(vpCss.width) + 'px';
+    canvas.style.height = Math.round(vpCss.height) + 'px';
+    canvas._page = page;
+    canvas._pageNum = i;
+    canvas._renderedScale = 0;
+    div.appendChild(canvas);
+    scrollEl.appendChild(div);
+    rs.canvases.push(canvas);
+  }
+}
+
+function setupReaderObserver() {
+  const rs = readerState;
+  rs.io = new IntersectionObserver((entries) => {
+    for (const e of entries) if (e.isIntersecting) renderPage(e.target);
+  }, { root: rs.scrollEl, rootMargin: '600px 0px' });
+  rs.canvases.forEach((c) => rs.io.observe(c));
+}
+
+async function renderPage(canvas) {
+  const rs = readerState;
+  if (!rs) return;
+  const renderScale = rs.baseScale * rs.zoom * rs.dpr;
+  if (canvas._renderedScale === renderScale) return;
+  const page = canvas._page;
+  const vp = page.getViewport({ scale: renderScale });
+  if (canvas.width !== Math.ceil(vp.width)) canvas.width = Math.ceil(vp.width);
+  if (canvas.height !== Math.ceil(vp.height)) canvas.height = Math.ceil(vp.height);
+  const ctx = canvas.getContext('2d');
+  if (canvas._renderTask) { try { canvas._renderTask.cancel(); } catch (e) { /* ignore */ } }
+  try {
+    canvas._renderTask = page.render({ canvasContext: ctx, viewport: vp });
+    await canvas._renderTask.promise;
+    canvas._renderedScale = renderScale;
+  } catch (e) {
+    // RenderingCancelledException（缩放/关闭时取消），忽略
+  }
+}
+
+function currentReaderPage() {
+  const rs = readerState;
+  const top = rs.scrollEl.getBoundingClientRect().top;
+  let cur = 1;
+  for (const c of rs.canvases) {
+    if (c.getBoundingClientRect().top - top <= 30) cur = c._pageNum;
+  }
+  return cur;
+}
+
+function onReaderScroll() {
+  const rs = readerState;
+  if (!rs || !rs.ready) return;
+  const st = rs.scrollEl.scrollTop;
+  const sh = rs.scrollEl.scrollHeight - rs.scrollEl.clientHeight;
+  const frac = sh > 0 ? st / sh : 0;
+  const cur = currentReaderPage();
+  document.getElementById('reader-pageinfo').textContent = cur + ' / ' + rs.numPages;
+  document.getElementById('reader-progress-fill').style.width = (Math.max(0, Math.min(1, frac)) * 100) + '%';
+  if (rs.saveTimer) clearTimeout(rs.saveTimer);
+  rs.saveTimer = setTimeout(() => saveReaderProgress(frac), 500);
+}
+
+async function saveReaderProgress(frac) {
+  const rs = readerState;
+  if (!rs || !rs.paper) return;
+  try {
+    const p = rs.paper;
+    p.read_progress = Math.max(0, Math.min(1, frac));
+    p.updated_at = nowISO();
+    await dbPut(p);
+  } catch (e) { console.warn('保存进度失败', e); }
+}
+
+function restoreReaderProgress() {
+  const rs = readerState;
+  const frac = (rs.paper && typeof rs.paper.read_progress === 'number') ? rs.paper.read_progress : 0;
+  requestAnimationFrame(() => {
+    const sh = rs.scrollEl.scrollHeight - rs.scrollEl.clientHeight;
+    rs.scrollEl.scrollTop = frac * sh;
+    onReaderScroll();
+  });
+}
+
+function readerZoom(delta) {
+  const rs = readerState;
+  if (!rs || !rs.ready) return;
+  rs.zoom = Math.max(0.5, Math.min(4, rs.zoom * delta));
+  const scale = rs.baseScale * rs.zoom;
+  const prevFrac = rs.scrollEl.scrollHeight > rs.scrollEl.clientHeight
+    ? rs.scrollEl.scrollTop / (rs.scrollEl.scrollHeight - rs.scrollEl.clientHeight) : 0;
+  for (const c of rs.canvases) {
+    const vpCss = c._page.getViewport({ scale });
+    c.style.width = Math.round(vpCss.width) + 'px';
+    c.style.height = Math.round(vpCss.height) + 'px';
+    c._renderedScale = 0; // 失效，触发重渲染
+  }
+  requestAnimationFrame(() => {
+    const sh = rs.scrollEl.scrollHeight - rs.scrollEl.clientHeight;
+    rs.scrollEl.scrollTop = prevFrac * sh;
+    const vh = window.innerHeight;
+    for (const c of rs.canvases) {
+      const r = c.getBoundingClientRect();
+      if (r.bottom > 0 && r.top < vh) renderPage(c);
+    }
+  });
+}
+
+function closeReader() {
+  const rs = readerState;
+  if (rs) {
+    if (rs.saveTimer) { clearTimeout(rs.saveTimer); saveReaderProgressNow(); }
+    if (rs.io) rs.io.disconnect();
+    if (rs.loadingTask) { try { rs.loadingTask.destroy(); } catch (e) { /* ignore */ } }
+    if (rs.scrollEl) rs.scrollEl.removeEventListener('scroll', onReaderScroll);
+  }
+  document.getElementById('reader').classList.remove('show');
+  readerState = null;
+  render(); // 刷新列表（read_progress 已写回）
+}
+
+function saveReaderProgressNow() {
+  const rs = readerState;
+  if (!rs || !rs.paper) return;
+  const sh = rs.scrollEl.scrollHeight - rs.scrollEl.clientHeight;
+  const frac = sh > 0 ? rs.scrollEl.scrollTop / sh : 0;
+  const p = rs.paper;
+  p.read_progress = Math.max(0, Math.min(1, frac));
+  p.updated_at = nowISO();
+  dbPut(p).catch(() => {});
+}
+
+document.getElementById('reader-close').addEventListener('click', closeReader);
+document.getElementById('reader-zoom-in').addEventListener('click', () => readerZoom(1.2));
+document.getElementById('reader-zoom-out').addEventListener('click', () => readerZoom(1 / 1.2));
 
 // ===== Service Worker 注册（M1 仅缓存 app 壳；更新提示留 M7）=====
 if ('serviceWorker' in navigator) {
