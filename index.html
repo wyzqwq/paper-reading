@@ -96,6 +96,8 @@
     border-radius: 6px; padding: 8px 10px; font-size: 14px; font-family: inherit;
   }
   .modal textarea { min-height: 80px; resize: vertical; }
+  .modal .row { display: flex; gap: 8px; align-items: stretch; }
+  .modal .row > input { flex: 1; }
   .modal .btns { display: flex; gap: 8px; margin-top: 16px; }
   .modal .btns button { flex: 1; padding: 10px; border-radius: 6px; cursor: pointer; font-size: 14px; }
   .btn-primary { background: var(--accent); color: #fff; border: none; }
@@ -178,7 +180,20 @@
     <select id="f-source">
       <option value="manual">手动录入</option>
       <option value="url">URL（其它网站 PDF / 页面）</option>
+      <option value="arxiv">arXiv（链接 / ID）</option>
+      <option value="local">本地 PDF 文件</option>
     </select>
+    <div id="src-arxiv" class="src-fields" style="display:none">
+      <label>arXiv 链接或 ID</label>
+      <div class="row">
+        <input id="f-arxiv-input" placeholder="https://arxiv.org/abs/1706.03762 或 1706.03762">
+        <button type="button" id="f-arxiv-fetch" class="btn-secondary" style="flex:0 0 auto">拉取</button>
+      </div>
+    </div>
+    <div id="src-local" class="src-fields" style="display:none">
+      <label>PDF 文件</label>
+      <input type="file" id="f-file" accept="application/pdf">
+    </div>
     <label>URL</label>
     <input id="f-url" placeholder="https://...">
     <label>摘要</label>
@@ -220,9 +235,9 @@
 </div>
 
 <script>
-// ===== IndexedDB：papers store（字段按计划书 §4.1 子集；M1 只本地，M6 接 Supabase 同步）=====
+// ===== IndexedDB：papers + pdfFiles（M3 加 pdfFiles 存本地 PDF 二进制；§4.1 子集；M6 接 Supabase 同步）=====
 const DB_NAME = 'paper-reading';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 let db = null;
 
 function openDB() {
@@ -234,6 +249,10 @@ function openDB() {
         const s = d.createObjectStore('papers', { keyPath: 'id' });
         s.createIndex('status', 'status', { unique: false });
         s.createIndex('updated_at', 'updated_at', { unique: false });
+      }
+      // v2：本地 PDF 二进制 store（key = paper.id）
+      if (!d.objectStoreNames.contains('pdfFiles')) {
+        d.createObjectStore('pdfFiles', { keyPath: 'id' });
       }
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
@@ -276,6 +295,33 @@ function dbDelete(id) {
   });
 }
 
+// pdfFiles store（M3）：存本地 PDF 二进制，key = paper.id；M6 同步时改走 Supabase Storage
+function fileStore(mode) { return db.transaction('pdfFiles', mode).objectStore('pdfFiles'); }
+
+function dbPutFile(file) {
+  return new Promise((resolve, reject) => {
+    const req = fileStore('readwrite').put(file);
+    req.onsuccess = () => resolve(file);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function dbGetFile(id) {
+  return new Promise((resolve, reject) => {
+    const req = fileStore('readonly').get(id);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function dbDeleteFile(id) {
+  return new Promise((resolve, reject) => {
+    const req = fileStore('readwrite').delete(id);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
 // ===== 模型 =====
 const STATUS_LABEL = { want: '想读', reading: '在读', done: '已读', abandoned: '弃读' };
 
@@ -289,18 +335,21 @@ function parseList(str) {
 let currentRating = 0;
 let editingId = null;     // 当前编辑条目 id；null=新增
 let editingPaper = null;  // 编辑时保留旧条目（保住 arxiv_id/local_file_path/read_progress/added_at）
+let currentArxivId = null;  // M3：arXiv 拉取到的 id（保存时写入 paper.arxiv_id）
+let currentFileData = null; // M3：本地 PDF 选中后的 ArrayBuffer（保存时写入 pdfFiles store）
 
 function makePaperFromForm() {
   const existing = editingId ? (editingPaper || {}) : {};
+  const src = document.getElementById('f-source').value;
   return {
     id: document.getElementById('f-id').value || uid(),
     title: document.getElementById('f-title').value.trim(),
     authors: parseList(document.getElementById('f-authors').value),
     abstract: document.getElementById('f-abstract').value.trim() || null,
-    source_type: document.getElementById('f-source').value,
-    arxiv_id: existing.arxiv_id || null,
+    source_type: src,
+    arxiv_id: (src === 'arxiv' && currentArxivId) ? currentArxivId : (existing.arxiv_id || null),
     url: document.getElementById('f-url').value.trim() || null,
-    local_file_path: existing.local_file_path || null,
+    local_file_path: src === 'local' ? (existing.local_file_path || 'local') : null,
     status: document.getElementById('f-status').value,
     rating: currentRating || null,
     tags: parseList(document.getElementById('f-tags').value),
@@ -335,6 +384,13 @@ function statusActions(status) {
   return btns.join('');
 }
 
+function canRead(p) {
+  // local：本地 PDF 存在即读（openReader 内再校验）；arXiv/url：需可解析的 http(s) PDF 链接
+  if (p.source_type === 'local') return true;
+  const u = resolvePdfUrl(p);
+  return !!u && /^https?:\/\//i.test(u);
+}
+
 function renderCard(p) {
   const el = document.createElement('div');
   el.className = 'card';
@@ -355,7 +411,7 @@ function renderCard(p) {
     `</div>` +
     urlHtml +
     `<div class="actions">` +
-      (resolvePdfUrl(p) ? `<button data-act="read">阅读</button>` : '') +
+      (canRead(p) ? `<button data-act="read">阅读</button>` : '') +
       `<button data-act="edit">编辑</button>` +
       statusActions(p.status) +
       `<button data-act="delete" class="danger">删除</button>` +
@@ -408,14 +464,18 @@ function openEditor(p) {
   p = p || null;
   editingId = p ? p.id : null;
   editingPaper = p || null;
+  currentArxivId = p ? (p.arxiv_id || null) : null;
+  currentFileData = null;
   document.getElementById('modal-title').textContent = p ? '编辑论文' : '新增论文';
   document.getElementById('modal-hint').textContent = p
     ? '修改后保存即更新该条目。'
-    : '手动录入论文信息（arXiv 一键导入在 M3 上线）。';
+    : '可手动录入；或选「arXiv」一键拉取元数据，选「本地 PDF 文件」导入。';
   document.getElementById('f-id').value = p ? p.id : '';
   document.getElementById('f-title').value = p ? (p.title || '') : '';
   document.getElementById('f-authors').value = p ? (p.authors || []).join(', ') : '';
   document.getElementById('f-source').value = p ? (p.source_type || 'manual') : 'manual';
+  document.getElementById('f-arxiv-input').value = p && p.arxiv_id ? p.arxiv_id : '';
+  document.getElementById('f-file').value = '';
   document.getElementById('f-url').value = p ? (p.url || '') : '';
   document.getElementById('f-abstract').value = p ? (p.abstract || '') : '';
   document.getElementById('f-status').value = p ? (p.status || 'want') : 'want';
@@ -423,6 +483,7 @@ function openEditor(p) {
   document.getElementById('f-notes').value = p ? (p.notes_md || '') : '';
   currentRating = p ? (p.rating || 0) : 0;
   renderStars();
+  updateSourceFields();
   document.getElementById('overlay').classList.add('show');
 }
 
@@ -433,8 +494,27 @@ function closeEditor() {
 async function save() {
   const paper = makePaperFromForm();
   if (!paper.title) { alert('请填写标题'); return; }
+  // 本地 PDF：新增条目必须选了文件
+  if (paper.source_type === 'local' && !currentFileData && !editingId) {
+    alert('请选择本地 PDF 文件。'); return;
+  }
   try {
     await dbPut(paper);
+    // 本地 PDF：有新选文件就写入 pdfFiles（key=paper.id）
+    if (paper.source_type === 'local' && currentFileData) {
+      await dbPutFile({
+        id: paper.id,
+        data: currentFileData,
+        size: currentFileData.byteLength,
+        added_at: nowISO()
+      });
+    }
+    // 来源从 local 改成其它：清理旧 pdfFile，避免孤儿二进制
+    if (paper.source_type !== 'local' && editingId) {
+      await dbDeleteFile(paper.id).catch(() => {});
+    }
+    currentFileData = null;
+    currentArxivId = null;
     closeEditor();
     render();
   } catch (err) {
@@ -445,6 +525,7 @@ async function save() {
 async function del(p) {
   if (!confirm(`删除「${p.title}」？此操作不可撤销。`)) return;
   await dbDelete(p.id);
+  await dbDeleteFile(p.id).catch(() => {}); // 本地 PDF 二进制一并删
   render();
 }
 
@@ -482,6 +563,113 @@ document.querySelector('#f-rating .clr').addEventListener('click', () => {
   currentRating = 0; renderStars();
 });
 
+// ===== 导入：arXiv 元数据 / 本地 PDF（M3）=====
+document.getElementById('f-source').addEventListener('change', updateSourceFields);
+document.getElementById('f-arxiv-fetch').addEventListener('click', fetchArxiv);
+document.getElementById('f-file').addEventListener('change', async (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (!f) { currentFileData = null; return; }
+  if (f.size > 60 * 1024 * 1024) {
+    alert('PDF 超过 60MB，建议改用 URL 导入（M6 起可存 Supabase Storage）。');
+    e.target.value = '';
+    currentFileData = null;
+    return;
+  }
+  try {
+    currentFileData = await f.arrayBuffer();
+    // 标题为空时用文件名预填
+    if (!document.getElementById('f-title').value) {
+      document.getElementById('f-title').value = f.name.replace(/\.pdf$/i, '');
+    }
+  } catch (err) {
+    alert('读取文件失败：' + (err && err.message ? err.message : err));
+    currentFileData = null;
+  }
+});
+
+// ===== 导入辅助：arXiv 元数据解析 + 来源字段切换（M3）=====
+// arXiv API 经 Supabase Edge Function 代理（M0 实测 export.arxiv.org 不发 ACAO，浏览器直连被 CORS 阻）
+const ARXIV_PROXY = 'https://hjrrocbisrgtxgqnflpi.supabase.co/functions/v1/arxiv-proxy';
+const ATOM_NS = 'http://www.w3.org/2005/Atom';
+
+function extractArxivId(input) {
+  // 接受 arXiv 链接（abs/pdf）或纯 ID；新式 2310.12345[v2]、老式 cs.LG/0701001[v2]
+  if (!input) return null;
+  const m = String(input).trim().match(/([0-9]{4}\.[0-9]+(?:v[0-9]+)?|[a-z.\-]+\/[0-9]{7}(?:v[0-9]+)?)/i);
+  return m ? m[1] : null;
+}
+
+function textByTagNS(el, ns, tag) {
+  const n = el.getElementsByTagNameNS(ns, tag)[0];
+  return n ? (n.textContent || '').trim() : '';
+}
+
+function parseArxivXml(xml) {
+  const doc = new DOMParser().parseFromString(xml, 'application/xml');
+  if (doc.getElementsByTagName('parsererror').length) {
+    throw new Error('arXiv 返回非合法 XML');
+  }
+  const entry = doc.getElementsByTagNameNS(ATOM_NS, 'entry')[0];
+  if (!entry) throw new Error('arXiv 未返回条目（ID 可能无效或被限流）');
+  // id 形如 http://arxiv.org/abs/1706.03762v2 -> 取 abs/ 后、去版本号
+  const idText = textByTagNS(entry, ATOM_NS, 'id');
+  const aidMatch = idText.match(/abs\/(.+?)(?:v\d+)?$/i);
+  const arxiv_id = aidMatch ? aidMatch[1] : '';
+  const title = textByTagNS(entry, ATOM_NS, 'title').replace(/\s+/g, ' ');
+  const summary = textByTagNS(entry, ATOM_NS, 'summary').replace(/\s+/g, ' ');
+  const authors = [];
+  const authorEls = entry.getElementsByTagNameNS(ATOM_NS, 'author');
+  for (let i = 0; i < authorEls.length; i++) {
+    const n = textByTagNS(authorEls[i], ATOM_NS, 'name');
+    if (n) authors.push(n);
+  }
+  const tags = [];
+  const catEls = entry.getElementsByTagNameNS(ATOM_NS, 'category');
+  for (let i = 0; i < catEls.length; i++) {
+    const t = catEls[i].getAttribute('term');
+    if (t) tags.push(t);
+  }
+  return {
+    arxiv_id,
+    title,
+    authors,
+    abstract: summary,
+    url: arxiv_id ? ('https://arxiv.org/abs/' + arxiv_id) : '',
+    tags
+  };
+}
+
+async function fetchArxiv() {
+  const input = document.getElementById('f-arxiv-input').value;
+  const aid = extractArxivId(input);
+  const btn = document.getElementById('f-arxiv-fetch');
+  if (!aid) { alert('无法识别 arXiv ID。请粘贴 arXiv 链接或 ID（如 1706.03762）。'); return; }
+  btn.disabled = true; btn.textContent = '拉取中…';
+  try {
+    const res = await fetch(ARXIV_PROXY + '?id_list=' + encodeURIComponent(aid));
+    if (!res.ok) throw new Error('代理返回 HTTP ' + res.status);
+    const xml = await res.text();
+    const meta = parseArxivXml(xml);
+    if (!meta.title) throw new Error('未解析到标题');
+    document.getElementById('f-title').value = meta.title;
+    document.getElementById('f-authors').value = meta.authors.join(', ');
+    document.getElementById('f-abstract').value = meta.abstract;
+    document.getElementById('f-url').value = meta.url;
+    document.getElementById('f-tags').value = meta.tags.join(', ');
+    currentArxivId = meta.arxiv_id;
+  } catch (e) {
+    alert('arXiv 拉取失败：' + (e && e.message ? e.message : e));
+  } finally {
+    btn.disabled = false; btn.textContent = '拉取';
+  }
+}
+
+function updateSourceFields() {
+  const src = document.getElementById('f-source').value;
+  document.getElementById('src-arxiv').style.display = (src === 'arxiv') ? '' : 'none';
+  document.getElementById('src-local').style.display = (src === 'local') ? '' : 'none';
+}
+
 // ===== 阅读器（M2：pdf.js 连续滚动 + 进度记忆）=====
 let pdfjsLib = null;
 let readerState = null;
@@ -496,8 +684,23 @@ function resolvePdfUrl(p) {
 }
 
 async function openReader(paper) {
-  const url = resolvePdfUrl(paper);
-  if (!url) { alert('该条目没有可加载的 PDF 链接（本地 PDF 导入在 M3 上线）。'); return; }
+  // 决定加载源：local 走 IndexedDB 二进制（dbGetFile）；arXiv/url 走 resolvePdfUrl（abs 归一化为 pdf）
+  let url = null;
+  let docInit = {};
+  if (paper.source_type === 'local') {
+    try {
+      const file = await dbGetFile(paper.id);
+      if (!file || !file.data) { alert('本地 PDF 文件缺失（可能在清理或换设备后丢失）。'); return; }
+      docInit = { data: file.data };
+    } catch (e) {
+      alert('读取本地 PDF 失败：' + (e && e.message ? e.message : e));
+      return;
+    }
+  } else {
+    url = resolvePdfUrl(paper);
+    if (!url) { alert('该条目没有可加载的 PDF 链接。'); return; }
+    docInit = { url };
+  }
   const overlay = document.getElementById('reader');
   overlay.classList.add('show');
   const scrollEl = document.getElementById('reader-scroll');
@@ -530,7 +733,7 @@ async function openReader(paper) {
 
   try {
     const task = pdfjsLib.getDocument({
-      url,
+      ...docInit,
       wasmUrl: './vendor/pdfjs/wasm/',
       standardFontDataUrl: './vendor/pdfjs/standard_fonts/'
     });
@@ -546,7 +749,7 @@ async function openReader(paper) {
   } catch (e) {
     scrollEl.innerHTML = '<div class="reader-error">PDF 加载失败：' +
       escapeHtml(e && e.message || String(e)) +
-      '<br>可能链接非 PDF、网络问题或跨域限制。</div>';
+      '<br>可能文件损坏、网络问题或跨域限制。</div>';
   }
 }
 

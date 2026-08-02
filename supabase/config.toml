@@ -1,0 +1,6 @@
+# Supabase 项目配置（M3 起）
+# 项目 ref：hjrrocbisrgtxgqnflpi（M0 建的独立项目）
+
+[functions.arxiv-proxy]
+# arXiv API 公开，代理无需鉴权；前端不带 JWT 也能调。
+verify_jwt = false
