@@ -135,12 +135,64 @@
     display: flex; flex-direction: column; align-items: center; gap: 12px;
     -webkit-overflow-scrolling: touch;
   }
-  .reader-page { display: flex; justify-content: center; }
+  .reader-page { display: flex; justify-content: center; position: relative; }
   .reader-page canvas {
     display: block; background: #fff; box-shadow: 0 2px 12px rgba(0,0,0,0.5);
   }
   .reader-loading, .reader-error { color: var(--muted); text-align: center; padding: 40px 20px; font-size: 14px; }
   .reader-error { color: var(--danger); }
+  /* textLayer（M4）：透明文字层，盖在 canvas 上让文字可选/可高亮 */
+  .textLayer {
+    position: absolute; left: 0; top: 0; overflow: hidden; line-height: 1;
+    z-index: 2; opacity: 1; text-align: initial;
+  }
+  .textLayer span, .textLayer br {
+    color: transparent; position: absolute; white-space: pre; cursor: text;
+    transform-origin: 0% 0%;
+  }
+  .textLayer ::selection { background: rgba(108,140,255,0.35); }
+  .textLayer mark.hl {
+    color: transparent; border-radius: 1px; padding: 0; cursor: pointer;
+  }
+  /* 高亮菜单（M4） */
+  .hl-menu {
+    position: fixed; z-index: 50; display: flex; align-items: center; gap: 6px;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+  }
+  .hl-swatch {
+    width: 20px; height: 20px; border-radius: 50%; border: 2px solid var(--border);
+    cursor: pointer; padding: 0;
+  }
+  .hl-swatch.sel { border-color: var(--text); box-shadow: 0 0 0 2px var(--accent); }
+  .hl-menu input {
+    background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 4px; padding: 4px 6px; font-size: 13px; width: 130px;
+  }
+  .hl-delete { background: var(--danger); color: #fff; border: none; border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 13px; }
+  /* 阅读器笔记面板（M4） */
+  .reader-notes {
+    position: fixed; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom));
+    z-index: 45; width: min(420px, 92vw); background: var(--bg);
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.6); display: flex; flex-direction: column; gap: 8px;
+  }
+  .reader-notes textarea {
+    width: 100%; min-height: 140px; resize: vertical; box-sizing: border-box;
+    background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px; font-size: 14px; font-family: inherit; line-height: 1.5;
+  }
+  .reader-notes-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  /* 编辑器批注汇总（M4） */
+  .anno-list { display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow-y: auto; }
+  .anno-item {
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 8px; font-size: 12px; cursor: pointer;
+  }
+  .anno-item .anno-meta { color: var(--muted); font-size: 11px; margin-bottom: 2px; }
+  .anno-item .anno-text { color: var(--text); }
+  .anno-item .anno-note { color: var(--accent); margin-top: 2px; }
+  .anno-empty { color: var(--muted); font-size: 12px; padding: 4px 0; }
 </style>
 </head>
 <body>
@@ -214,6 +266,8 @@
     <input id="f-tags" placeholder="transformer, nlp">
     <label>笔记（Markdown）</label>
     <textarea id="f-notes" placeholder="阅读笔记..."></textarea>
+    <label>批注汇总</label>
+    <div class="anno-list" id="anno-list"></div>
     <div class="btns">
       <button class="btn-secondary" id="cancel-btn">取消</button>
       <button class="btn-primary" id="save-btn">保存</button>
@@ -230,14 +284,31 @@
       <button id="reader-zoom-out" aria-label="缩小">−</button>
       <button id="reader-zoom-in" aria-label="放大">＋</button>
     </div>
+    <button class="reader-notes-btn" id="reader-notes-btn" aria-label="笔记">笔记</button>
   </div>
   <div class="reader-scroll" id="reader-scroll"></div>
+  <!-- 选中文字弹出的高亮/批注菜单（M4） -->
+  <div class="hl-menu" id="hl-menu" style="display:none">
+    <button type="button" class="hl-swatch" data-color="yellow" style="background:rgba(255,204,64,0.55)" title="黄" aria-label="黄"></button>
+    <button type="button" class="hl-swatch" data-color="blue" style="background:rgba(108,140,255,0.55)" title="蓝" aria-label="蓝"></button>
+    <input type="text" id="hl-note" placeholder="批注（可选）">
+    <button type="button" class="btn-primary" id="hl-save">高亮</button>
+    <button type="button" class="hl-delete" id="hl-delete" style="display:none">删除</button>
+  </div>
+  <!-- 条目笔记面板（M4） -->
+  <div class="reader-notes" id="reader-notes" style="display:none">
+    <textarea id="reader-notes-area" placeholder="这篇论文的笔记（Markdown）…"></textarea>
+    <div class="reader-notes-actions">
+      <button type="button" class="btn-secondary" id="reader-notes-close">收起</button>
+      <button type="button" class="btn-primary" id="reader-notes-save">保存</button>
+    </div>
+  </div>
 </div>
 
 <script>
-// ===== IndexedDB：papers + pdfFiles（M3 加 pdfFiles 存本地 PDF 二进制；§4.1 子集；M6 接 Supabase 同步）=====
+// ===== IndexedDB：papers + pdfFiles + annotations（M3 加 pdfFiles，M4 加 annotations；§4.1/§4.2 子集；M6 接 Supabase 同步）=====
 const DB_NAME = 'paper-reading';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 let db = null;
 
 function openDB() {
@@ -253,6 +324,11 @@ function openDB() {
       // v2：本地 PDF 二进制 store（key = paper.id）
       if (!d.objectStoreNames.contains('pdfFiles')) {
         d.createObjectStore('pdfFiles', { keyPath: 'id' });
+      }
+      // v3：高亮批注 store（§4.2 annotations：id/paper_id/page/text/offsets/color/note/created_at）
+      if (!d.objectStoreNames.contains('annotations')) {
+        const a = d.createObjectStore('annotations', { keyPath: 'id' });
+        a.createIndex('paper_id', 'paper_id', { unique: false });
       }
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
@@ -320,6 +396,41 @@ function dbDeleteFile(id) {
     req.onsuccess = () => resolve();
     req.onerror = () => reject(req.error);
   });
+}
+
+// annotations store（M4）：高亮批注，§4.2。key=id，索引 paper_id
+function annoStore(mode) { return db.transaction('annotations', mode).objectStore('annotations'); }
+
+function dbPutAnno(a) {
+  return new Promise((resolve, reject) => {
+    const req = annoStore('readwrite').put(a);
+    req.onsuccess = () => resolve(a);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function dbGetAnnosByPaper(paperId) {
+  return new Promise((resolve, reject) => {
+    const idx = annoStore('readonly').index('paper_id');
+    const req = idx.getAll(paperId);
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function dbDeleteAnno(id) {
+  return new Promise((resolve, reject) => {
+    const req = annoStore('readwrite').delete(id);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// 删除某条目全部批注（删论文时调用，避免孤儿）
+function dbDeleteAnnosByPaper(paperId) {
+  return dbGetAnnosByPaper(paperId).then((annos) =>
+    Promise.all(annos.map((a) => dbDeleteAnno(a.id)))
+  );
 }
 
 // ===== 模型 =====
@@ -460,6 +571,46 @@ function renderStars() {
   });
 }
 
+// 批注汇总（M4）：列该条目全部高亮，点击跳阅读器对应页，附删除
+async function renderAnnoList(paperId) {
+  const el = document.getElementById('anno-list');
+  if (!el) return;
+  if (!paperId) { el.innerHTML = '<div class="anno-empty">新增条目尚无批注（阅读时选中文字可加）。</div>'; return; }
+  let annos = [];
+  try { annos = await dbGetAnnosByPaper(paperId); } catch (e) { annos = []; }
+  annos.sort((a, b) => a.page - b.page || a.start_offset - b.start_offset);
+  if (annos.length === 0) { el.innerHTML = '<div class="anno-empty">暂无批注。</div>'; return; }
+  el.innerHTML = '';
+  for (const a of annos) {
+    const item = document.createElement('div');
+    item.className = 'anno-item';
+    const text = a.text || '';
+    const excerpt = text.slice(0, 60) + (text.length > 60 ? '…' : '');
+    item.innerHTML =
+      '<div class="anno-meta">第 ' + a.page + ' 页 · ' + (a.color === 'blue' ? '蓝' : '黄') + '</div>' +
+      '<div class="anno-text">' + escapeHtml(excerpt) + '</div>' +
+      (a.note ? '<div class="anno-note">批注：' + escapeHtml(a.note) + '</div>' : '');
+    item.addEventListener('click', async () => {
+      closeEditor();
+      const all = await dbAll();
+      const paper = all.find((x) => x.id === a.paper_id);
+      if (paper) openReader(paper, a.page);
+    });
+    const delBtn = document.createElement('button');
+    delBtn.className = 'hl-delete';
+    delBtn.textContent = '删';
+    delBtn.style.cssText = 'margin-top:4px;padding:2px 8px;font-size:11px';
+    delBtn.addEventListener('click', async (ev) => {
+      ev.stopPropagation();
+      if (!confirm('删除这条批注？')) return;
+      await dbDeleteAnno(a.id).catch(() => {});
+      renderAnnoList(paperId);
+    });
+    item.appendChild(delBtn);
+    el.appendChild(item);
+  }
+}
+
 function openEditor(p) {
   p = p || null;
   editingId = p ? p.id : null;
@@ -484,6 +635,7 @@ function openEditor(p) {
   currentRating = p ? (p.rating || 0) : 0;
   renderStars();
   updateSourceFields();
+  renderAnnoList(p ? p.id : null);
   document.getElementById('overlay').classList.add('show');
 }
 
@@ -526,6 +678,7 @@ async function del(p) {
   if (!confirm(`删除「${p.title}」？此操作不可撤销。`)) return;
   await dbDelete(p.id);
   await dbDeleteFile(p.id).catch(() => {}); // 本地 PDF 二进制一并删
+  await dbDeleteAnnosByPaper(p.id).catch(() => {}); // 高亮批注一并删
   render();
 }
 
@@ -683,7 +836,7 @@ function resolvePdfUrl(p) {
   return u;
 }
 
-async function openReader(paper) {
+async function openReader(paper, jumpPage) {
   // 决定加载源：local 走 IndexedDB 二进制（dbGetFile）；arXiv/url 走 resolvePdfUrl（abs 归一化为 pdf）
   let url = null;
   let docInit = {};
@@ -728,7 +881,11 @@ async function openReader(paper) {
   readerState = {
     paper: p, url, pdf: null, loadingTask: null, numPages: 0,
     canvases: [], baseScale: 1, zoom: 1, dpr: window.devicePixelRatio || 1,
-    io: null, saveTimer: null, scrollEl, ready: false
+    io: null, saveTimer: null, scrollEl, ready: false,
+    textLayers: {},      // pageNum -> {layer, container, textDivs}（M4）
+    textContentCache: {},// pageNum -> getTextContent 结果（M4，避免缩放重取）
+    annos: [],           // 该论文全部高亮批注（M4）
+    hlDraft: null        // 当前菜单草稿（new/edit）
   };
 
   try {
@@ -741,11 +898,15 @@ async function openReader(paper) {
     const pdf = await task.promise;
     readerState.pdf = pdf;
     readerState.numPages = pdf.numPages;
+    // 拉该论文已有高亮批注（M4）
+    try { readerState.annos = await dbGetAnnosByPaper(p.id); } catch (e) { readerState.annos = []; }
     await layoutPages();
     readerState.ready = true;
     setupReaderObserver();
-    restoreReaderProgress();
+    if (jumpPage) scrollToPage(jumpPage); else restoreReaderProgress();
     scrollEl.addEventListener('scroll', onReaderScroll, { passive: true });
+    scrollEl.addEventListener('mouseup', onReaderMouseUp);
+    scrollEl.addEventListener('click', onReaderClick);
   } catch (e) {
     scrollEl.innerHTML = '<div class="reader-error">PDF 加载失败：' +
       escapeHtml(e && e.message || String(e)) +
@@ -778,7 +939,16 @@ async function layoutPages() {
     canvas._page = page;
     canvas._pageNum = i;
     canvas._renderedScale = 0;
+    canvas._tlScale = 0; // textLayer 已渲染的 scale（M4）
     div.appendChild(canvas);
+    // textLayer 容器（M4）：盖在 canvas 上，实际 TextLayer.render 在 renderPage 里懒渲染
+    const tlDiv = document.createElement('div');
+    tlDiv.className = 'textLayer';
+    tlDiv.dataset.pageNum = i;
+    tlDiv.style.width = Math.round(vpCss.width) + 'px';
+    tlDiv.style.height = Math.round(vpCss.height) + 'px';
+    div.appendChild(tlDiv);
+    canvas._textLayerDiv = tlDiv;
     scrollEl.appendChild(div);
     rs.canvases.push(canvas);
   }
@@ -796,20 +966,51 @@ async function renderPage(canvas) {
   const rs = readerState;
   if (!rs) return;
   const renderScale = rs.baseScale * rs.zoom * rs.dpr;
-  if (canvas._renderedScale === renderScale) return;
   const page = canvas._page;
-  const vp = page.getViewport({ scale: renderScale });
-  if (canvas.width !== Math.ceil(vp.width)) canvas.width = Math.ceil(vp.width);
-  if (canvas.height !== Math.ceil(vp.height)) canvas.height = Math.ceil(vp.height);
-  const ctx = canvas.getContext('2d');
-  if (canvas._renderTask) { try { canvas._renderTask.cancel(); } catch (e) { /* ignore */ } }
-  try {
-    canvas._renderTask = page.render({ canvasContext: ctx, viewport: vp });
-    await canvas._renderTask.promise;
-    canvas._renderedScale = renderScale;
-  } catch (e) {
-    // RenderingCancelledException（缩放/关闭时取消），忽略
+  // canvas 渲染
+  if (canvas._renderedScale !== renderScale) {
+    const vp = page.getViewport({ scale: renderScale });
+    if (canvas.width !== Math.ceil(vp.width)) canvas.width = Math.ceil(vp.width);
+    if (canvas.height !== Math.ceil(vp.height)) canvas.height = Math.ceil(vp.height);
+    const ctx = canvas.getContext('2d');
+    if (canvas._renderTask) { try { canvas._renderTask.cancel(); } catch (e) { /* ignore */ } }
+    try {
+      canvas._renderTask = page.render({ canvasContext: ctx, viewport: vp });
+      await canvas._renderTask.promise;
+      canvas._renderedScale = renderScale;
+    } catch (e) {
+      // RenderingCancelledException（缩放/关闭时取消），忽略
+    }
   }
+  // textLayer 渲染（M4，缩放变了就重建）+ 应用高亮
+  const cssScale = rs.baseScale * rs.zoom;
+  if (canvas._tlScale !== cssScale) {
+    await renderTextLayer(canvas, cssScale);
+    applyHighlights(canvas._pageNum);
+  }
+}
+
+// 渲染某页 textLayer（M4）：pdf.js v6 TextLayer，透明文字层供选中/高亮
+async function renderTextLayer(canvas, cssScale) {
+  const rs = readerState;
+  const pageNum = canvas._pageNum;
+  const page = canvas._page;
+  const vpCss = page.getViewport({ scale: cssScale });
+  const container = canvas._textLayerDiv;
+  container.innerHTML = '';
+  container.style.width = Math.round(vpCss.width) + 'px';
+  container.style.height = Math.round(vpCss.height) + 'px';
+  let tc = rs.textContentCache[pageNum];
+  if (!tc) {
+    tc = await page.getTextContent();
+    rs.textContentCache[pageNum] = tc;
+  }
+  const tl = new pdfjsLib.TextLayer({
+    textContentSource: tc, container, viewport: vpCss, textDivs: []
+  });
+  try { await tl.render(); } catch (e) { /* 缩放/关闭取消，忽略 */ }
+  rs.textLayers[pageNum] = { layer: tl, container, textDivs: tl.textDivs || [] };
+  canvas._tlScale = cssScale;
 }
 
 function currentReaderPage() {
@@ -856,6 +1057,17 @@ function restoreReaderProgress() {
   });
 }
 
+// 跳到指定页（批注汇总点击用，M4）
+function scrollToPage(pageNum) {
+  const rs = readerState;
+  if (!rs) return;
+  const canvas = rs.canvases.find((c) => c._pageNum === pageNum);
+  if (canvas && canvas.parentElement && canvas.parentElement.scrollIntoView) {
+    canvas.parentElement.scrollIntoView({ block: 'start' });
+  }
+  onReaderScroll();
+}
+
 function readerZoom(delta) {
   const rs = readerState;
   if (!rs || !rs.ready) return;
@@ -868,6 +1080,7 @@ function readerZoom(delta) {
     c.style.width = Math.round(vpCss.width) + 'px';
     c.style.height = Math.round(vpCss.height) + 'px';
     c._renderedScale = 0; // 失效，触发重渲染
+    c._tlScale = 0;       // textLayer 也失效，重建后重新应用高亮（M4）
   }
   requestAnimationFrame(() => {
     const sh = rs.scrollEl.scrollHeight - rs.scrollEl.clientHeight;
@@ -885,12 +1098,22 @@ function closeReader() {
   if (rs) {
     if (rs.saveTimer) { clearTimeout(rs.saveTimer); saveReaderProgressNow(); }
     if (rs.io) rs.io.disconnect();
+    // 取消所有 textLayer（M4）
+    for (const k in rs.textLayers) {
+      try { rs.textLayers[k].layer.cancel(); } catch (e) { /* ignore */ }
+    }
     if (rs.loadingTask) { try { rs.loadingTask.destroy(); } catch (e) { /* ignore */ } }
-    if (rs.scrollEl) rs.scrollEl.removeEventListener('scroll', onReaderScroll);
+    if (rs.scrollEl) {
+      rs.scrollEl.removeEventListener('scroll', onReaderScroll);
+      rs.scrollEl.removeEventListener('mouseup', onReaderMouseUp);
+      rs.scrollEl.removeEventListener('click', onReaderClick);
+    }
   }
+  hideHlMenu();
+  document.getElementById('reader-notes').style.display = 'none';
   document.getElementById('reader').classList.remove('show');
   readerState = null;
-  render(); // 刷新列表（read_progress 已写回）
+  render(); // 刷新列表（read_progress / notes 已写回）
 }
 
 function saveReaderProgressNow() {
@@ -904,9 +1127,231 @@ function saveReaderProgressNow() {
   dbPut(p).catch(() => {});
 }
 
+// ===== 高亮批注（M4）=====
+const HIGHLIGHT_COLORS = { yellow: 'rgba(255,204,64,0.45)', blue: 'rgba(108,140,255,0.45)' };
+let currentHlColor = 'yellow';
+
+// 应用某页全部高亮：先清旧 mark 再按偏移重包（缩放/增删后重画）
+function applyHighlights(pageNum) {
+  const rs = readerState;
+  const tl = rs && rs.textLayers[pageNum];
+  if (!tl) return;
+  const pageEl = tl.container;
+  pageEl.querySelectorAll('mark.hl').forEach((m) => {
+    const parent = m.parentNode;
+    while (m.firstChild) parent.insertBefore(m.firstChild, m);
+    parent.removeChild(m);
+    parent.normalize();
+  });
+  const annos = rs.annos.filter((a) => a.page === pageNum).sort((a, b) => a.start_offset - b.start_offset);
+  for (const a of annos) wrapTextRange(pageEl, a.start_offset, a.end_offset, a);
+}
+
+// 把 [start,end) 字符范围包进 <mark>（用 TreeWalker 定位文本节点）
+function wrapTextRange(pageEl, start, end, anno) {
+  if (end <= start) return false;
+  const walker = document.createTreeWalker(pageEl, NodeFilter.SHOW_TEXT);
+  let cur = 0, node, startNode = null, startOff = 0, endNode = null, endOff = 0;
+  while ((node = walker.nextNode())) {
+    const len = node.nodeValue.length;
+    if (!startNode && cur + len >= start) { startNode = node; startOff = start - cur; }
+    if (!endNode && cur + len >= end) { endNode = node; endOff = end - cur; }
+    cur += len;
+    if (endNode) break;
+  }
+  if (!startNode || !endNode) return false;
+  const range = document.createRange();
+  range.setStart(startNode, Math.max(0, startOff));
+  range.setEnd(endNode, Math.max(0, endOff));
+  const mark = document.createElement('mark');
+  mark.className = 'hl';
+  mark.dataset.annoId = anno.id;
+  mark.style.backgroundColor = HIGHLIGHT_COLORS[anno.color] || HIGHLIGHT_COLORS.yellow;
+  if (anno.note) mark.title = anno.note;
+  try { range.surroundContents(mark); return true; }
+  catch (e) {
+    // 跨节点（已有 mark）时 surroundContents 失败，退回 extract+wrap
+    try { const frag = range.extractContents(); mark.appendChild(frag); range.insertNode(mark); return true; }
+    catch (e2) { return false; }
+  }
+}
+
+// 从当前 Selection 算出在 pageEl 文本里的 [start,end) 偏移（用 Range.toString().length）
+function captureSelection(pageEl) {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
+  const range = sel.getRangeAt(0);
+  const startR = document.createRange();
+  startR.selectNodeContents(pageEl);
+  startR.setEnd(range.startContainer, range.startOffset);
+  const endR = document.createRange();
+  endR.selectNodeContents(pageEl);
+  endR.setEnd(range.endContainer, range.endOffset);
+  let start = startR.toString().length;
+  let end = endR.toString().length;
+  if (start > end) { const t = start; start = end; end = t; }
+  const text = sel.toString();
+  if (end <= start || !text || !text.trim()) return null;
+  return { start, end, text };
+}
+
+function onReaderMouseUp() {
+  setTimeout(() => {
+    const rs = readerState;
+    if (!rs) return;
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
+    const range = sel.getRangeAt(0);
+    let el = range.startContainer;
+    if (el.nodeType !== 1) el = el.parentNode;
+    const tlEl = el && el.closest ? el.closest('.textLayer') : null;
+    if (!tlEl) return;
+    const pageNum = Number(tlEl.dataset.pageNum);
+    if (!pageNum) return;
+    const rect = range.getBoundingClientRect();
+    showHlMenu(rect.left + rect.width / 2, rect.bottom, 'new', null, pageNum);
+  }, 0);
+}
+
+function onReaderClick(e) {
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed) return; // 选中场景由 mouseup 处理
+  const mark = e.target && e.target.closest ? e.target.closest('mark.hl') : null;
+  if (mark) {
+    const annoId = mark.dataset.annoId;
+    const anno = readerState && readerState.annos.find((a) => a.id === annoId);
+    if (anno) {
+      const r = mark.getBoundingClientRect();
+      showHlMenu(r.left, r.bottom, 'edit', anno, anno.page);
+    }
+    return;
+  }
+  hideHlMenu();
+}
+
+function showHlMenu(x, y, mode, anno, pageNum) {
+  const rs = readerState;
+  if (!rs) return;
+  const menu = document.getElementById('hl-menu');
+  if (mode === 'new') {
+    const tl = rs.textLayers[pageNum];
+    const pageEl = tl && tl.container;
+    const cap = pageEl ? captureSelection(pageEl) : null;
+    if (!cap) { hideHlMenu(); return; }
+    rs.hlDraft = { mode: 'new', pageNum, start: cap.start, end: cap.end, text: cap.text, annoId: null };
+    document.getElementById('hl-delete').style.display = 'none';
+    document.getElementById('hl-save').textContent = '高亮';
+    document.getElementById('hl-note').value = '';
+    currentHlColor = 'yellow';
+  } else {
+    rs.hlDraft = { mode: 'edit', pageNum, annoId: anno.id, start: anno.start_offset, end: anno.end_offset, text: anno.text };
+    document.getElementById('hl-delete').style.display = '';
+    document.getElementById('hl-save').textContent = '更新';
+    document.getElementById('hl-note').value = anno.note || '';
+    currentHlColor = anno.color || 'yellow';
+  }
+  updateSwatchSel();
+  menu.style.display = 'flex';
+  const mw = menu.offsetWidth || 240;
+  let left = x - mw / 2;
+  left = Math.max(8, Math.min(left, window.innerWidth - mw - 8));
+  menu.style.left = left + 'px';
+  menu.style.top = (y + 8) + 'px';
+}
+
+function hideHlMenu() {
+  const menu = document.getElementById('hl-menu');
+  if (menu) menu.style.display = 'none';
+  if (readerState) readerState.hlDraft = null;
+}
+
+function updateSwatchSel() {
+  document.querySelectorAll('#hl-menu .hl-swatch').forEach((b) => {
+    b.classList.toggle('sel', b.dataset.color === currentHlColor);
+  });
+}
+
+async function saveHighlight(color, note) {
+  const rs = readerState;
+  const draft = rs && rs.hlDraft;
+  if (!draft || draft.mode !== 'new') return;
+  const anno = {
+    id: uid(), paper_id: rs.paper.id, page: draft.pageNum, text: draft.text,
+    start_offset: draft.start, end_offset: draft.end,
+    color: color || 'yellow', note: note || null, created_at: nowISO()
+  };
+  try { await dbPutAnno(anno); rs.annos.push(anno); applyHighlights(draft.pageNum); }
+  catch (e) { alert('保存高亮失败：' + (e && e.message ? e.message : e)); }
+  const sel = window.getSelection();
+  if (sel) sel.removeAllRanges();
+  hideHlMenu();
+}
+
+async function updateHighlight(color, note) {
+  const rs = readerState;
+  const draft = rs && rs.hlDraft;
+  if (!draft || draft.mode !== 'edit') return;
+  const anno = rs.annos.find((a) => a.id === draft.annoId);
+  if (!anno) return;
+  anno.color = color || anno.color;
+  anno.note = note || null;
+  try { await dbPutAnno(anno); } catch (e) { alert('更新失败：' + (e && e.message ? e.message : e)); }
+  applyHighlights(anno.page);
+  hideHlMenu();
+}
+
+async function deleteHighlight() {
+  const rs = readerState;
+  const draft = rs && rs.hlDraft;
+  if (!draft || draft.mode !== 'edit') return;
+  if (!confirm('删除这条高亮？')) return;
+  try { await dbDeleteAnno(draft.annoId); } catch (e) { /* ignore */ }
+  rs.annos = rs.annos.filter((a) => a.id !== draft.annoId);
+  applyHighlights(draft.pageNum);
+  hideHlMenu();
+}
+
+// 阅读器笔记面板（M4）
+function toggleReaderNotes() {
+  const rs = readerState;
+  if (!rs) return;
+  const panel = document.getElementById('reader-notes');
+  const area = document.getElementById('reader-notes-area');
+  if (!panel.style.display || panel.style.display === 'none') {
+    area.value = (rs.paper.notes_md || '');
+    panel.style.display = 'flex';
+  } else {
+    panel.style.display = 'none';
+  }
+}
+
+async function saveReaderNotes() {
+  const rs = readerState;
+  if (!rs || !rs.paper) return;
+  rs.paper.notes_md = document.getElementById('reader-notes-area').value;
+  rs.paper.updated_at = nowISO();
+  try { await dbPut(rs.paper); } catch (e) { alert('笔记保存失败：' + (e && e.message ? e.message : e)); }
+  document.getElementById('reader-notes').style.display = 'none';
+}
+
 document.getElementById('reader-close').addEventListener('click', closeReader);
 document.getElementById('reader-zoom-in').addEventListener('click', () => readerZoom(1.2));
 document.getElementById('reader-zoom-out').addEventListener('click', () => readerZoom(1 / 1.2));
+document.getElementById('reader-notes-btn').addEventListener('click', toggleReaderNotes);
+document.getElementById('reader-notes-close').addEventListener('click', () => {
+  document.getElementById('reader-notes').style.display = 'none';
+});
+document.getElementById('reader-notes-save').addEventListener('click', saveReaderNotes);
+document.querySelectorAll('#hl-menu .hl-swatch').forEach((b) => {
+  b.addEventListener('click', () => { currentHlColor = b.dataset.color; updateSwatchSel(); });
+});
+document.getElementById('hl-save').addEventListener('click', () => {
+  const rs = readerState; const draft = rs && rs.hlDraft; if (!draft) return;
+  const note = document.getElementById('hl-note').value.trim();
+  if (draft.mode === 'new') saveHighlight(currentHlColor, note);
+  else updateHighlight(currentHlColor, note);
+});
+document.getElementById('hl-delete').addEventListener('click', deleteHighlight);
 
 // ===== Service Worker 注册（M1 仅缓存 app 壳；更新提示留 M7）=====
 if ('serviceWorker' in navigator) {
