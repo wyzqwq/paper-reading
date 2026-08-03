@@ -2296,8 +2296,24 @@ document.getElementById('hl-save').addEventListener('click', () => {
 });
 document.getElementById('hl-delete').addEventListener('click', deleteHighlight);
 
-// ===== Service Worker 注册（M1 仅缓存 app 壳；更新提示留 M7）=====
+// ===== Service Worker 注册 + 更新提示（M7）=====
 if ('serviceWorker' in navigator) {
+  let refreshing = false;
+  const hadController = !!navigator.serviceWorker.controller; // 注册前是否有旧 SW（区分首次注册 vs 版本更新）
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    // 新 SW 接管（skipWaiting 后触发）；仅更新场景（非首次）显示刷新横幅
+    if (refreshing || !hadController) return;
+    let b = document.getElementById('update-banner');
+    if (!b) {
+      b = document.createElement('div');
+      b.id = 'update-banner';
+      b.textContent = '有新版本，点击刷新';
+      b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:100;background:var(--accent);color:var(--bg);text-align:center;padding:9px;font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.4)';
+      b.addEventListener('click', () => { refreshing = true; location.reload(); });
+      document.body.appendChild(b);
+    }
+    b.style.display = 'block';
+  });
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('sw.js').catch((err) => console.warn('SW 注册失败:', err));
   });
