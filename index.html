@@ -167,11 +167,11 @@
   .reader-progress > div { height: 100%; background: var(--accent); width: 0%; transition: width 0.1s; }
   .reader-zoom { display: flex; gap: 4px; }
   .reader-scroll {
-    flex: 1; overflow-y: auto; overflow-x: hidden; padding: 12px 0;
-    display: flex; flex-direction: column; align-items: center; gap: 12px;
+    flex: 1; overflow-y: auto; overflow-x: auto; padding: 12px 0;
+    display: flex; flex-direction: column; align-items: flex-start; gap: 12px;
     -webkit-overflow-scrolling: touch;
   }
-  .reader-page { display: flex; justify-content: center; position: relative; }
+  .reader-page { display: flex; justify-content: center; position: relative; margin: 0 auto; }
   .reader-page canvas {
     display: block; background: #fff; box-shadow: 0 2px 12px rgba(0,0,0,0.5);
   }
@@ -185,6 +185,7 @@
   .textLayer {
     position: absolute; left: 0; top: 0; overflow: hidden; line-height: 1;
     z-index: 2; opacity: 1; text-align: initial;
+    -webkit-text-size-adjust: none; text-size-adjust: none; forced-color-adjust: none;
     /* pdf.js v6 TextLayer 需要的 CSS 变量（--total-scale-factor 按 zoom 动态写，见 renderTextLayer） */
     --scale-round-x: 1px; --scale-round-y: 1px;
     --min-font-size: 1;
@@ -207,6 +208,15 @@
   }
   .textLayer .markedContent { display: contents; }
   .textLayer ::selection { background: rgba(201,169,110,0.35); }
+  /* pdf.js endOfContent（render 自动创建该 div）：约束选区在 textLayer 内，拖到边界时扩展到页末
+     而不是跳到 UI（顶栏"笔记"按钮等）；user-select:none 作屏障。缺这条 iOS 会"选区跨整页+UI"。 */
+  .textLayer .endOfContent {
+    display: block; position: absolute; inset: 100% 0 0; z-index: -1;
+    cursor: default; -webkit-user-select: none; user-select: none;
+  }
+  .textLayer.selecting .endOfContent {
+    top: 0; height: 100%; z-index: -1; -webkit-user-select: none; user-select: none;
+  }
   .textLayer mark.hl {
     color: transparent; border-radius: 1px; padding: 0; cursor: pointer;
   }
@@ -1861,6 +1871,7 @@ async function layoutPages() {
     canvas.height = Math.ceil(vpRender.height);
     canvas.style.width = Math.round(vpCss.width) + 'px';
     canvas.style.height = Math.round(vpCss.height) + 'px';
+    div.style.width = Math.round(vpCss.width) + 'px'; // M7：page 宽=canvas 宽，zoom>1 时 scrollEl 可水平滚动平移
     canvas._page = page;
     canvas._pageNum = i;
     canvas._renderedScale = 0;
@@ -1939,6 +1950,14 @@ async function renderTextLayer(canvas, cssScale) {
   // 显式覆盖容器尺寸：setLayerDimensions 用 round()（旧浏览器可能不支持），且确保与 canvas 像素对齐
   container.style.width = Math.round(vpCss.width) + 'px';
   container.style.height = Math.round(vpCss.height) + 'px';
+  // endOfContent（pdf.js v6 TextLayerBuilder 才会创建，核心 TextLayer.render 不自动加）：
+  // 配合 .selecting 类让该 div 覆盖 textLayer 作 user-select:none 屏障，约束选区不跨到 UI（顶栏"笔记"按钮等）
+  if (!container.querySelector('.endOfContent')) {
+    const eoc = document.createElement('div');
+    eoc.className = 'endOfContent';
+    eoc.setAttribute('aria-hidden', 'true');
+    container.appendChild(eoc);
+  }
   rs.textLayers[pageNum] = { layer: tl, container, textDivs: tl.textDivs || [] };
   canvas._tlScale = cssScale;
 }
@@ -2043,6 +2062,7 @@ function readerZoom(delta, targetZoom) {
     const vpCss = c._page.getViewport({ scale });
     c.style.width = Math.round(vpCss.width) + 'px';
     c.style.height = Math.round(vpCss.height) + 'px';
+    if (c.parentElement) c.parentElement.style.width = Math.round(vpCss.width) + 'px'; // M7：同步 page 宽，水平滚动范围正确
     c._renderedScale = 0; // 失效，触发重渲染
     c._tlScale = 0;       // textLayer 也失效，重建后重新应用高亮（M4）
   }
@@ -2160,6 +2180,10 @@ function captureSelection(pageEl) {
   const sel = window.getSelection();
   if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
   const range = sel.getRangeAt(0);
+  // M7 守卫：选区起/终点须在该 pageEl 内，且不是整个容器自身（防 iOS 把 textLayer 当整体选中 -> 整页高亮，
+  // 也防选区跨到顶栏 UI 如"笔记"按钮 -> offset 算成整页+UI）
+  if (!pageEl.contains(range.startContainer) || !pageEl.contains(range.endContainer)) return null;
+  if (range.startContainer === pageEl || range.endContainer === pageEl) return null;
   const startR = document.createRange();
   startR.selectNodeContents(pageEl);
   startR.setEnd(range.startContainer, range.startOffset);
@@ -2178,20 +2202,30 @@ let selChangeTimer = null;
 function onReaderSelectionChange() {
   const rs = readerState;
   if (!rs) return;
+  // 即时管理 .selecting 类（不等防抖）：选区与某 textLayer 相交时给它加 selecting，
+  // 让 endOfContent 覆盖该 textLayer 作 user-select:none 屏障（防选区跨到顶栏 UI）
+  const sel = window.getSelection();
+  const intersects = !!(sel && !sel.isCollapsed && sel.rangeCount > 0);
+  const range = intersects ? sel.getRangeAt(0) : null;
+  for (const k in rs.textLayers) {
+    const tl = rs.textLayers[k].container;
+    if (range && range.intersectsNode(tl)) tl.classList.add('selecting');
+    else tl.classList.remove('selecting');
+  }
   clearTimeout(selChangeTimer);
   // 防抖 300ms：拖拽选区把手时 selectionchange 持续触发，松手后选区稳定才弹菜单
   selChangeTimer = setTimeout(() => {
     if (!readerState) return; // 阅读器可能已关
-    const sel = window.getSelection();
-    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
-    const range = sel.getRangeAt(0);
-    let el = range.startContainer;
+    const sel2 = window.getSelection();
+    if (!sel2 || sel2.isCollapsed || sel2.rangeCount === 0) return;
+    const range2 = sel2.getRangeAt(0);
+    let el = range2.startContainer;
     if (el.nodeType !== 1) el = el.parentNode;
     const tlEl = el && el.closest ? el.closest('.textLayer') : null;
     if (!tlEl) return; // 选区不在 textLayer（如输入框）不弹菜单
     const pageNum = Number(tlEl.dataset.pageNum);
     if (!pageNum) return;
-    const rect = range.getBoundingClientRect();
+    const rect = range2.getBoundingClientRect();
     showHlMenu(rect.left + rect.width / 2, rect.bottom, 'new', null, pageNum);
   }, 300);
 }
