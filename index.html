@@ -1829,6 +1829,9 @@ async function openReader(paper, jumpPage) {
     // 改听 document selectionchange + 防抖 300ms，松手后选区稳定即弹高亮菜单，鼠标/触摸通用
     document.addEventListener('selectionchange', onReaderSelectionChange);
     scrollEl.addEventListener('click', onReaderClick);
+    scrollEl.addEventListener('touchstart', onReaderTouchStart, { passive: false });
+    scrollEl.addEventListener('touchmove', onReaderTouchMove, { passive: false });
+    scrollEl.addEventListener('touchend', onReaderTouchEnd);
   } catch (e) {
     scrollEl.innerHTML = '<div class="reader-error">PDF 加载失败：' +
       escapeHtml(e && e.message || String(e)) +
@@ -1950,6 +1953,37 @@ function currentReaderPage() {
   return cur;
 }
 
+// 捏合缩放（M7）：双指 pinch 直接设目标 zoom（初始 zoom × 距离比），rAF 节流避免频繁重渲染
+function pinchDist(t) {
+  const dx = t[0].clientX - t[1].clientX, dy = t[0].clientY - t[1].clientY;
+  return Math.hypot(dx, dy);
+}
+let pinchRaf = null, pinchTarget = null;
+function onReaderTouchStart(e) {
+  const rs = readerState;
+  if (!rs || !rs.ready) return;
+  if (e.touches.length === 2) {
+    e.preventDefault(); // 阻止 iOS 浏览器双指页面缩放
+    rs._pinching = true;
+    rs._pinchInitialDist = pinchDist(e.touches);
+    rs._pinchInitialZoom = rs.zoom;
+  }
+}
+function onReaderTouchMove(e) {
+  const rs = readerState;
+  if (!rs || !rs._pinching || e.touches.length !== 2) return;
+  e.preventDefault(); // 双指时阻止默认（页面缩放/滚动），单指滚动不受影响（上面 return）
+  if (rs._pinchInitialDist > 0) {
+    pinchTarget = rs._pinchInitialZoom * (pinchDist(e.touches) / rs._pinchInitialDist);
+    if (!pinchRaf) pinchRaf = requestAnimationFrame(() => { pinchRaf = null; readerZoom(undefined, pinchTarget); });
+  }
+}
+function onReaderTouchEnd(e) {
+  const rs = readerState;
+  if (!rs) return;
+  if (e.touches.length < 2) rs._pinching = false;
+}
+
 function onReaderScroll() {
   const rs = readerState;
   if (!rs || !rs.ready) return;
@@ -1995,10 +2029,13 @@ function scrollToPage(pageNum) {
   onReaderScroll();
 }
 
-function readerZoom(delta) {
+function readerZoom(delta, targetZoom) {
   const rs = readerState;
   if (!rs || !rs.ready) return;
-  rs.zoom = Math.max(0.5, Math.min(4, rs.zoom * delta));
+  // targetZoom 优先（捏合手势直接设目标倍数），否则按 delta 乘当前 zoom
+  rs.zoom = targetZoom !== undefined
+    ? Math.max(0.5, Math.min(4, targetZoom))
+    : Math.max(0.5, Math.min(4, rs.zoom * delta));
   const scale = rs.baseScale * rs.zoom;
   const prevFrac = rs.scrollEl.scrollHeight > rs.scrollEl.clientHeight
     ? rs.scrollEl.scrollTop / (rs.scrollEl.scrollHeight - rs.scrollEl.clientHeight) : 0;
@@ -2034,6 +2071,9 @@ function closeReader() {
       rs.scrollEl.removeEventListener('scroll', onReaderScroll);
       document.removeEventListener('selectionchange', onReaderSelectionChange);
       rs.scrollEl.removeEventListener('click', onReaderClick);
+      rs.scrollEl.removeEventListener('touchstart', onReaderTouchStart);
+      rs.scrollEl.removeEventListener('touchmove', onReaderTouchMove);
+      rs.scrollEl.removeEventListener('touchend', onReaderTouchEnd);
     }
   }
   hideHlMenu();
