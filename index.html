@@ -1182,7 +1182,18 @@ document.getElementById('acct-signup').addEventListener('click', async () => {
   const pass = document.getElementById('acct-pass').value;
   if (!email || !pass) { setAcctMsg('请填邮箱和密码', true); return; }
   setAcctMsg('注册中…');
-  try { await sbSignup(email, pass); renderAcct(); setAcctMsg('注册成功，已登录'); syncPull().catch((e) => setAcctMsg('同步失败：' + e.message, true)); }
+  try {
+    const data = await sbSignup(email, pass);
+    if (data.access_token) {
+      // email confirm 关闭：signup 直接返回 session
+      renderAcct();
+      setAcctMsg('注册成功，已登录');
+      syncPull().catch((e) => setAcctMsg('同步失败：' + e.message, true));
+    } else {
+      // email confirm 开启：需到邮箱点验证链接，验证后才能登录
+      setAcctMsg('验证邮件已发送，请到邮箱点击验证链接后再点"登录"');
+    }
+  }
   catch (e) { setAcctMsg(e.message, true); }
 });
 document.getElementById('acct-logout').addEventListener('click', async () => {
@@ -1814,7 +1825,9 @@ async function openReader(paper, jumpPage) {
     setupReaderObserver();
     if (jumpPage) scrollToPage(jumpPage); else restoreReaderProgress();
     scrollEl.addEventListener('scroll', onReaderScroll, { passive: true });
-    scrollEl.addEventListener('mouseup', onReaderMouseUp);
+    // 选区监听用 selectionchange（非 mouseup）：iOS 选文本松手时系统接管触摸、mouseup 不触发；
+    // 改听 document selectionchange + 防抖 300ms，松手后选区稳定即弹高亮菜单，鼠标/触摸通用
+    document.addEventListener('selectionchange', onReaderSelectionChange);
     scrollEl.addEventListener('click', onReaderClick);
   } catch (e) {
     scrollEl.innerHTML = '<div class="reader-error">PDF 加载失败：' +
@@ -2019,7 +2032,7 @@ function closeReader() {
     if (rs.loadingTask) { try { rs.loadingTask.destroy(); } catch (e) { /* ignore */ } }
     if (rs.scrollEl) {
       rs.scrollEl.removeEventListener('scroll', onReaderScroll);
-      rs.scrollEl.removeEventListener('mouseup', onReaderMouseUp);
+      document.removeEventListener('selectionchange', onReaderSelectionChange);
       rs.scrollEl.removeEventListener('click', onReaderClick);
     }
   }
@@ -2121,22 +2134,26 @@ function captureSelection(pageEl) {
   return { start, end, text };
 }
 
-function onReaderMouseUp() {
-  setTimeout(() => {
-    const rs = readerState;
-    if (!rs) return;
+let selChangeTimer = null;
+function onReaderSelectionChange() {
+  const rs = readerState;
+  if (!rs) return;
+  clearTimeout(selChangeTimer);
+  // 防抖 300ms：拖拽选区把手时 selectionchange 持续触发，松手后选区稳定才弹菜单
+  selChangeTimer = setTimeout(() => {
+    if (!readerState) return; // 阅读器可能已关
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
     const range = sel.getRangeAt(0);
     let el = range.startContainer;
     if (el.nodeType !== 1) el = el.parentNode;
     const tlEl = el && el.closest ? el.closest('.textLayer') : null;
-    if (!tlEl) return;
+    if (!tlEl) return; // 选区不在 textLayer（如输入框）不弹菜单
     const pageNum = Number(tlEl.dataset.pageNum);
     if (!pageNum) return;
     const rect = range.getBoundingClientRect();
     showHlMenu(rect.left + rect.width / 2, rect.bottom, 'new', null, pageNum);
-  }, 0);
+  }, 300);
 }
 
 function onReaderClick(e) {
