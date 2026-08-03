@@ -445,6 +445,23 @@ function openDB() {
       if (!d.objectStoreNames.contains('dismissed')) {
         d.createObjectStore('dismissed', { keyPath: 'arxiv_id' });
       }
+      // v5：M6 同步 -- 给现有 papers/annotations/subscriptions 补 _dirty=true（首次同步全量推）+ 补 updated_at（旧对象可能无）
+      if (e.oldVersion < 5) {
+        for (const sn of ['papers', 'annotations', 'subscriptions']) {
+          if (!d.objectStoreNames.contains(sn)) continue;
+          const os = e.target.transaction.objectStore(sn);
+          os.openCursor().onsuccess = (ev) => {
+            const c = ev.target.result;
+            if (!c) return;
+            const obj = c.value;
+            let changed = false;
+            if (obj._dirty === undefined) { obj._dirty = true; changed = true; }
+            if (!obj.updated_at) { obj.updated_at = obj.created_at || nowISO(); changed = true; }
+            if (changed) c.update(obj);
+            c.continue();
+          };
+        }
+      }
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
     req.onerror = () => reject(req.error);
@@ -472,6 +489,7 @@ function dbAll() {
 
 function dbPut(paper) {
   if (!paper.updated_at) paper.updated_at = nowISO();
+  paper._dirty = true;
   return new Promise((resolve, reject) => {
     const req = store('readwrite').put(paper);
     req.onsuccess = () => { schedulePush(); resolve(paper); };
@@ -490,6 +508,7 @@ function dbDelete(id) {
       if (!p) return;
       p.deleted_at = nowISO();
       p.updated_at = nowISO();
+      p._dirty = true;
       s.put(p);
     };
     g.onerror = () => reject(g.error);
@@ -530,6 +549,7 @@ function annoStore(mode) { return db.transaction('annotations', mode).objectStor
 
 function dbPutAnno(a) {
   if (!a.updated_at) a.updated_at = nowISO();
+  a._dirty = true;
   return new Promise((resolve, reject) => {
     const req = annoStore('readwrite').put(a);
     req.onsuccess = () => { schedulePush(); resolve(a); };
@@ -557,6 +577,7 @@ function dbDeleteAnno(id) {
       if (!a) return;
       a.deleted_at = nowISO();
       a.updated_at = nowISO();
+      a._dirty = true;
       s.put(a);
     };
     g.onerror = () => reject(g.error);
@@ -578,6 +599,7 @@ function subStore(mode) { return db.transaction('subscriptions', mode).objectSto
 
 function dbPutSub(sub) {
   if (!sub.updated_at) sub.updated_at = nowISO();
+  sub._dirty = true;
   return new Promise((resolve, reject) => {
     const req = subStore('readwrite').put(sub);
     req.onsuccess = () => { schedulePush(); resolve(sub); };
@@ -604,6 +626,7 @@ function dbDelSub(id) {
       if (!sub) return;
       sub.deleted_at = nowISO();
       sub.updated_at = nowISO();
+      sub._dirty = true;
       s.put(sub);
     };
     g.onerror = () => reject(g.error);
@@ -617,7 +640,7 @@ function dismissStore(mode) { return db.transaction('dismissed', mode).objectSto
 
 function dbPutDismiss(arxivId) {
   return new Promise((resolve, reject) => {
-    const req = dismissStore('readwrite').put({ arxiv_id: arxivId, dismissed_at: nowISO() });
+    const req = dismissStore('readwrite').put({ arxiv_id: arxivId, dismissed_at: nowISO(), _dirty: true });
     req.onsuccess = () => { schedulePush(); resolve(); };
     req.onerror = () => reject(req.error);
   });
@@ -1174,13 +1197,25 @@ function schedulePush() {
   if (pushTimer) clearTimeout(pushTimer);
   pushTimer = setTimeout(() => { syncPush().catch((e) => console.warn('push failed:', e.message)); }, 2000);
 }
-// last_sync = 最后一次成功 push 的时刻；pull 不更新（避免未 push 的本地 dirty 被跳过），push 全部成功才更新
-function getLastSync() { return localStorage.getItem('sb_last_sync') || null; }
-function setLastSync(iso) { localStorage.setItem('sb_last_sync', iso); }
+let pushing = false; // syncPush 并发守卫
 function tsOf(v) { const t = new Date(v).getTime(); return isNaN(t) ? 0 : t; }
 
-// 直接读写（绕过 schedulePush，供 syncPull/syncPush 内部用，避免 pull 写本地又触发 push）
+// fetch 包装：401（token 过期）自动 sbRefresh 重试一次（BUG 8）
+async function sbFetch(url, opts) {
+  let res = await fetch(url, opts);
+  if (res.status === 401) {
+    const refreshed = await sbRefresh();
+    if (refreshed) {
+      opts = Object.assign({}, opts, { headers: Object.assign({}, opts.headers, { Authorization: 'Bearer ' + refreshed.access_token }) });
+      res = await fetch(url, opts);
+    }
+  }
+  return res;
+}
+
+// 直接读写（绕过 schedulePush，供 syncPull/syncPush 内部用；rawPut 标记 _dirty=false 表示已同步）
 function rawPut(storeName, obj) {
+  obj._dirty = false;
   return new Promise((resolve, reject) => {
     const t = db.transaction(storeName, 'readwrite');
     t.objectStore(storeName).put(obj);
@@ -1205,7 +1240,7 @@ function rawGetAll(storeName) {
   });
 }
 
-// 打开 app / 登录后拉取：远端 updated_at > 本地则覆盖（含 deleted_at 软删传播）
+// 打开 app / 登录后拉取：远端 updated_at > 本地则覆盖（含 deleted_at 软删传播）；拉来的行 _dirty=false 不重推
 async function syncPull() {
   const s = sbSession();
   if (!s) return;
@@ -1213,20 +1248,20 @@ async function syncPull() {
   for (const { table, store: sn } of SYNC_TABLES) {
     let rows = [];
     try {
-      const res = await fetch(SB_REST + '/' + table + '?select=*', { headers });
+      const res = await sbFetch(SB_REST + '/' + table + '?select=*', { headers });
       if (!res.ok) { console.warn('pull ' + table + ':', res.status); continue; }
       rows = await res.json();
     } catch (e) { console.warn('pull ' + table + ' err:', e.message); continue; }
     for (const row of rows) {
       const local = await rawGet(sn, row.id);
       if (!local || tsOf(row.updated_at) > tsOf(local.updated_at)) {
-        await rawPut(sn, row);
+        await rawPut(sn, row); // rawPut 设 _dirty=false，拉来的不重推
       }
     }
   }
   // dismissed：upsert（无 LWW，按 arxiv_id 追加）
   try {
-    const dres = await fetch(SB_REST + '/dismissed?select=*', { headers });
+    const dres = await sbFetch(SB_REST + '/dismissed?select=*', { headers });
     if (dres.ok) {
       const rows = await dres.json();
       for (const row of rows) await rawPut('dismissed', { arxiv_id: row.arxiv_id, dismissed_at: row.dismissed_at });
@@ -1235,48 +1270,50 @@ async function syncPull() {
   render();
 }
 
-// 本地变更后防抖推送：updated_at > last_sync 的行 upsert（含软删行），用服务器返回的 updated_at 对齐本地
+// 本地变更后防抖推送：只推 _dirty=true 的行（dbPut/dbDelete 置 true），upsert 成功后置 false；_dirty 不进 Supabase
 async function syncPush() {
   const s = sbSession();
   if (!s) return;
-  const headers = sbHeaders(s.access_token);
-  const lastTs = tsOf(getLastSync()); // lastSync = 上次成功 push 时间（pull 不更新）
-  const userId = s.user.id;
-  let allOk = true;
-  for (const { table, store: sn } of SYNC_TABLES) {
-    const all = await rawGetAll(sn);
-    const dirty = all.filter((r) => tsOf(r.updated_at) > lastTs);
-    if (!dirty.length) continue;
-    const payload = dirty.map((r) => {
-      const x = Object.assign({}, r, { user_id: userId });
-      if (x.deleted_at === undefined) x.deleted_at = null;
-      return x;
-    });
-    try {
-      const res = await fetch(SB_REST + '/' + table + '?on_conflict=id', {
-        method: 'POST',
-        headers: Object.assign({}, headers, { Prefer: 'resolution=merge-duplicates,return=representation' }),
-        body: JSON.stringify(payload),
+  if (pushing) return; // 并发守卫：上一次 push 未完成则跳过（schedulePush 会再次触发）
+  pushing = true;
+  try {
+    const headers = sbHeaders(s.access_token);
+    const userId = s.user.id;
+    for (const { table, store: sn } of SYNC_TABLES) {
+      const all = await rawGetAll(sn);
+      const dirty = all.filter((r) => r._dirty === true);
+      if (!dirty.length) continue;
+      const payload = dirty.map((r) => {
+        const x = Object.assign({}, r, { user_id: userId });
+        delete x._dirty; // 本地标记，不进 Supabase
+        if (x.deleted_at === undefined) x.deleted_at = null;
+        return x;
       });
-      if (!res.ok) { console.warn('push ' + table + ':', res.status, await res.text()); allOk = false; continue; }
-      const returned = await res.json();
-      for (const row of returned) await rawPut(sn, row);
-    } catch (e) { console.warn('push ' + table + ' err:', e.message); allOk = false; }
-  }
-  // dismissed 全量 upsert（按 user_id+arxiv_id 冲突合并）
-  const dismissed = await rawGetAll('dismissed');
-  if (dismissed.length) {
-    const payload = dismissed.map((d) => ({ user_id: userId, arxiv_id: d.arxiv_id, dismissed_at: d.dismissed_at }));
-    try {
-      const res = await fetch(SB_REST + '/dismissed?on_conflict=user_id,arxiv_id', {
-        method: 'POST',
-        headers: Object.assign({}, headers, { Prefer: 'resolution=merge-duplicates' }),
-        body: JSON.stringify(payload),
-      });
-      if (!res.ok) { console.warn('push dismissed:', res.status); allOk = false; }
-    } catch (e) { console.warn('push dismissed err:', e.message); allOk = false; }
-  }
-  if (allOk) setLastSync(nowISO());
+      try {
+        const res = await sbFetch(SB_REST + '/' + table + '?on_conflict=id', {
+          method: 'POST',
+          headers: Object.assign({}, headers, { Prefer: 'resolution=merge-duplicates' }),
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) { console.warn('push ' + table + ':', res.status, await res.text()); continue; }
+        for (const r of dirty) { r._dirty = false; await rawPut(sn, r); } // 成功：标记已同步
+      } catch (e) { console.warn('push ' + table + ' err:', e.message); }
+    }
+    // dismissed：只推 _dirty=true
+    const dismissed = await rawGetAll('dismissed');
+    const dDirty = dismissed.filter((d) => d._dirty === true);
+    if (dDirty.length) {
+      const payload = dDirty.map((d) => ({ user_id: userId, arxiv_id: d.arxiv_id, dismissed_at: d.dismissed_at }));
+      try {
+        const res = await sbFetch(SB_REST + '/dismissed?on_conflict=user_id,arxiv_id', {
+          method: 'POST',
+          headers: Object.assign({}, headers, { Prefer: 'resolution=merge-duplicates' }),
+          body: JSON.stringify(payload),
+        });
+        if (res.ok) { for (const d of dDirty) { d._dirty = false; await rawPut('dismissed', d); } }
+      } catch (e) { console.warn('push dismissed err:', e.message); }
+    }
+  } finally { pushing = false; }
 }
 
 // ===== 今日推荐（M5 §4）：拉取 / 打分 / 过滤 / 去重 / 缓存 + 想读 / 跳过 =====
