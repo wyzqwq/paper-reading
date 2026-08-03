@@ -310,7 +310,7 @@
   <!-- 选中文字弹出的高亮/批注菜单（M4） -->
   <div class="hl-menu" id="hl-menu" style="display:none">
     <button type="button" class="hl-swatch" data-color="yellow" style="background:rgba(255,204,64,0.55)" title="黄" aria-label="黄"></button>
-    <button type="button" class="hl-swatch" data-color="blue" style="background:rgba(108,140,255,0.55)" title="蓝" aria-label="蓝"></button>
+    <button type="button" class="hl-swatch" data-color="cyan" style="background:rgba(34,211,238,0.55)" title="青" aria-label="青"></button>
     <input type="text" id="hl-note" placeholder="批注（可选）">
     <button type="button" class="btn-primary" id="hl-save">高亮</button>
     <button type="button" class="hl-delete" id="hl-delete" style="display:none">删除</button>
@@ -607,7 +607,7 @@ async function renderAnnoList(paperId) {
     const text = a.text || '';
     const excerpt = text.slice(0, 60) + (text.length > 60 ? '…' : '');
     item.innerHTML =
-      '<div class="anno-meta">第 ' + a.page + ' 页 · ' + (a.color === 'blue' ? '蓝' : '黄') + '</div>' +
+      '<div class="anno-meta">第 ' + a.page + ' 页 · ' + (a.color === 'yellow' ? '黄' : '青') + '</div>' +
       '<div class="anno-text">' + escapeHtml(excerpt) + '</div>' +
       (a.note ? '<div class="anno-note">批注：' + escapeHtml(a.note) + '</div>' : '');
     item.addEventListener('click', async () => {
@@ -1153,7 +1153,9 @@ function saveReaderProgressNow() {
 }
 
 // ===== 高亮批注（M4）=====
-const HIGHLIGHT_COLORS = { yellow: 'rgba(255,204,64,0.45)', blue: 'rgba(108,140,255,0.45)' };
+// 高亮双色：黄 + 青（cyan）。选中色 ::selection 仍用 App 强调蓝 rgba(108,140,255)，
+// 与青色高亮区分开（旧版用蓝高亮和选中同色，选中时分不清）。'blue' 为旧数据兼容，回退到青。
+const HIGHLIGHT_COLORS = { yellow: 'rgba(255,204,64,0.45)', cyan: 'rgba(34,211,238,0.45)' };
 let currentHlColor = 'yellow';
 
 // 应用某页全部高亮：先清旧 mark 再按偏移重包（缩放/增删后重画）
@@ -1199,7 +1201,7 @@ function wrapTextRange(pageEl, start, end, anno) {
     const mark = document.createElement('mark');
     mark.className = 'hl';
     mark.dataset.annoId = anno.id;
-    mark.style.backgroundColor = HIGHLIGHT_COLORS[anno.color] || HIGHLIGHT_COLORS.yellow;
+    mark.style.backgroundColor = HIGHLIGHT_COLORS[anno.color] || (anno.color === 'blue' ? HIGHLIGHT_COLORS.cyan : HIGHLIGHT_COLORS.yellow);
     if (anno.note) mark.title = anno.note;
     try { range.surroundContents(mark); any = true; }
     catch (e) {
