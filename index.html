@@ -340,6 +340,22 @@
 <div class="overlay" id="settings-overlay">
   <div class="modal" id="settings-modal">
     <h2>设置</h2>
+    <div id="acct-section" style="border-bottom:1px solid var(--border);padding-bottom:12px;margin-bottom:12px">
+      <label>账号同步（Supabase）</label>
+      <div id="acct-loggedout">
+        <input id="acct-email" type="email" placeholder="邮箱" autocomplete="email">
+        <input id="acct-pass" type="password" placeholder="密码" autocomplete="current-password" style="margin-top:6px">
+        <div class="btns" style="margin-top:8px">
+          <button class="btn-primary" id="acct-login">登录</button>
+          <button class="btn-secondary" id="acct-signup">注册</button>
+        </div>
+        <div class="hint" id="acct-msg"></div>
+      </div>
+      <div id="acct-loggedin" style="display:none">
+        <div class="hint" id="acct-user"></div>
+        <button class="btn-secondary" id="acct-logout" style="margin-top:8px;padding:8px 14px;font-size:13px">登出</button>
+      </div>
+    </div>
     <label>订阅管理（日推来源）</label>
     <div id="sub-list"></div>
     <button type="button" class="btn-secondary" id="sub-add" style="margin-top:8px;padding:8px 14px;font-size:13px">+ 新增订阅</button>
@@ -879,6 +895,7 @@ const ARXIV_CATS = [
 let editingSub = null; // null=新增，对象=编辑
 
 function openSettings() {
+  renderAcct();
   document.getElementById('settings-overlay').classList.add('show');
   closeSubEditor();
   renderSubList();
@@ -1011,6 +1028,101 @@ document.getElementById('sub-keywords').addEventListener('click', (e) => {
   if (!btn) return;
   const grp = btn.closest('.kw-group');
   if (grp) grp.remove();
+});
+
+// ===== 账号 + Supabase 配置（M6 §3.7：邮箱密码登录，原生 fetch）=====
+const SUPABASE_URL = 'https://hjrrocbisrgtxgqnflpi.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_XEWiA3mrtpfdg4UwK25FhQ_iJH4KdwT'; // publishable（anon）key，RLS 保护下公开安全
+const SB_AUTH = SUPABASE_URL + '/auth/v1';
+const SB_REST = SUPABASE_URL + '/rest/v1';
+
+function sbHeaders(token) {
+  const h = { apikey: SUPABASE_KEY, 'Content-Type': 'application/json' };
+  if (token) h['Authorization'] = 'Bearer ' + token;
+  return h;
+}
+function sbSession() {
+  try { return JSON.parse(localStorage.getItem('sb_session') || 'null'); } catch { return null; }
+}
+function sbSaveSession(s) { localStorage.setItem('sb_session', JSON.stringify(s)); }
+function sbClearSession() { localStorage.removeItem('sb_session'); }
+
+async function sbSignup(email, password) {
+  const res = await fetch(SB_AUTH + '/signup', {
+    method: 'POST', headers: sbHeaders(null),
+    body: JSON.stringify({ email, password }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.msg || data.message || data.error_description || '注册失败');
+  if (data.access_token) sbSaveSession({ access_token: data.access_token, refresh_token: data.refresh_token, user: data.user });
+  return data;
+}
+async function sbLogin(email, password) {
+  const res = await fetch(SB_AUTH + '/token?grant_type=password', {
+    method: 'POST', headers: sbHeaders(null),
+    body: JSON.stringify({ email, password }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.msg || data.message || data.error_description || '登录失败');
+  sbSaveSession({ access_token: data.access_token, refresh_token: data.refresh_token, user: data.user });
+  return data;
+}
+async function sbLogout() {
+  const s = sbSession();
+  if (s && s.access_token) {
+    try { await fetch(SB_AUTH + '/logout', { method: 'POST', headers: sbHeaders(s.access_token) }); } catch (e) {}
+  }
+  sbClearSession();
+}
+async function sbRefresh() {
+  const s = sbSession();
+  if (!s || !s.refresh_token) return null;
+  const res = await fetch(SB_AUTH + '/token?grant_type=refresh_token', {
+    method: 'POST', headers: sbHeaders(null),
+    body: JSON.stringify({ refresh_token: s.refresh_token }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { sbClearSession(); return null; }
+  sbSaveSession({ access_token: data.access_token, refresh_token: data.refresh_token, user: data.user });
+  return data;
+}
+function renderAcct() {
+  const s = sbSession();
+  const out = document.getElementById('acct-loggedout');
+  const inn = document.getElementById('acct-loggedin');
+  if (!out || !inn) return;
+  if (s && s.user) {
+    out.style.display = 'none';
+    inn.style.display = 'block';
+    document.getElementById('acct-user').textContent = '已登录：' + (s.user.email || '');
+  } else {
+    out.style.display = 'block';
+    inn.style.display = 'none';
+  }
+}
+function setAcctMsg(text, isErr) {
+  const el = document.getElementById('acct-msg');
+  if (el) { el.textContent = text || ''; el.style.color = isErr ? 'var(--danger)' : 'var(--muted)'; }
+}
+
+document.getElementById('acct-login').addEventListener('click', async () => {
+  const email = document.getElementById('acct-email').value.trim();
+  const pass = document.getElementById('acct-pass').value;
+  if (!email || !pass) { setAcctMsg('请填邮箱和密码', true); return; }
+  setAcctMsg('登录中…');
+  try { await sbLogin(email, pass); renderAcct(); setAcctMsg(''); /* TODO C3: 触发同步 */ }
+  catch (e) { setAcctMsg(e.message, true); }
+});
+document.getElementById('acct-signup').addEventListener('click', async () => {
+  const email = document.getElementById('acct-email').value.trim();
+  const pass = document.getElementById('acct-pass').value;
+  if (!email || !pass) { setAcctMsg('请填邮箱和密码', true); return; }
+  setAcctMsg('注册中…');
+  try { await sbSignup(email, pass); renderAcct(); setAcctMsg('注册成功，已登录'); /* TODO C3 */ }
+  catch (e) { setAcctMsg(e.message, true); }
+});
+document.getElementById('acct-logout').addEventListener('click', async () => {
+  await sbLogout(); renderAcct(); setAcctMsg('');
 });
 
 // ===== 今日推荐（M5 §4）：拉取 / 打分 / 过滤 / 去重 / 缓存 + 想读 / 跳过 =====
@@ -1932,7 +2044,7 @@ if ('serviceWorker' in navigator) {
 
 // ===== 启动 =====
 openDB()
-  .then(() => render())
+  .then(() => { renderAcct(); render(); })
   .catch((err) => {
     document.getElementById('list-queue').innerHTML =
       `<div class="empty">数据库打开失败：${escapeHtml(err && err.message ? err.message : err)}</div>`;
