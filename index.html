@@ -100,6 +100,33 @@
   .modal .row > input { flex: 1; }
   .modal .btns { display: flex; gap: 8px; margin-top: 16px; }
   .modal .btns button { flex: 1; padding: 10px; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  /* 设置页 + 订阅管理（M5）*/
+  .settings-btn {
+    position: absolute; right: 8px; top: calc(10px + env(safe-area-inset-top));
+    background: none; border: none; color: var(--muted); font-size: 20px; line-height: 1;
+    cursor: pointer; padding: 6px 8px; border-radius: 6px;
+  }
+  .settings-btn:hover { color: var(--text); }
+  .sub-item {
+    display: flex; align-items: center; gap: 8px; padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .sub-item .sub-name { flex: 1; font-size: 14px; min-width: 0; }
+  .sub-item .sub-name .sub-meta { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; word-break: break-all; }
+  .sub-item .sub-toggle { font-size: 12px; cursor: pointer; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+  .sub-item .sub-toggle.off { color: var(--muted); }
+  .cat-picker { display: flex; flex-wrap: wrap; gap: 6px; }
+  .cat-picker label {
+    font-size: 12px; display: flex; align-items: center; gap: 4px; margin: 0;
+    padding: 5px 10px; border: 1px solid var(--border); border-radius: 14px; cursor: pointer; color: var(--text);
+  }
+  .cat-picker input { width: auto; }
+  .kw-group { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+  .kw-group input { flex: 1; }
+  .kw-group .kw-del { flex: 0 0 auto; padding: 8px 12px; font-size: 14px; }
+  #sub-keywords { margin-bottom: 4px; }
+  #sub-editor { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); }
+  #sub-editor h3 { color: var(--text); }
   .btn-primary { background: var(--accent); color: #fff; border: none; }
   .btn-primary:hover { background: var(--accent-h); }
   .btn-secondary { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); }
@@ -218,6 +245,7 @@
 <body>
 <header>
   <h1>论文阅读</h1>
+  <button class="settings-btn" id="settings-btn" aria-label="设置">⚙</button>
   <nav class="tabs">
     <button data-tab="feed">今日推荐</button>
     <button data-tab="queue" class="active">阅读队列</button>
@@ -291,6 +319,35 @@
     <div class="btns">
       <button class="btn-secondary" id="cancel-btn">取消</button>
       <button class="btn-primary" id="save-btn">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 设置页（M5）：订阅管理 -->
+<div class="overlay" id="settings-overlay">
+  <div class="modal" id="settings-modal">
+    <h2>设置</h2>
+    <label>订阅管理（日推来源）</label>
+    <div id="sub-list"></div>
+    <button type="button" class="btn-secondary" id="sub-add" style="margin-top:8px;padding:8px 14px;font-size:13px">+ 新增订阅</button>
+    <div id="sub-editor" style="display:none">
+      <h3 id="sub-editor-title">新增订阅</h3>
+      <label>名称</label>
+      <input id="sub-name" placeholder="如：NLP 前沿">
+      <label>arXiv 分类（多选）</label>
+      <div class="cat-picker" id="sub-cats"></div>
+      <label>关键词组（组内逗号 = OR，组间 = AND；留空 = 只按分类拉）</label>
+      <div id="sub-keywords"></div>
+      <button type="button" class="btn-secondary" id="sub-kw-addgrp" style="font-size:12px;padding:6px 12px">+ 新增关键词组</button>
+      <label>启用</label>
+      <select id="sub-enabled"><option value="true">启用</option><option value="false">停用</option></select>
+      <div class="btns">
+        <button class="btn-secondary" id="sub-cancel">取消</button>
+        <button class="btn-primary" id="sub-save">保存订阅</button>
+      </div>
+    </div>
+    <div class="btns">
+      <button class="btn-primary" id="settings-close">关闭</button>
     </div>
   </div>
 </div>
@@ -791,6 +848,155 @@ document.getElementById('cancel-btn').addEventListener('click', closeEditor);
 document.getElementById('save-btn').addEventListener('click', save);
 document.getElementById('overlay').addEventListener('click', (e) => {
   if (e.target.id === 'overlay') closeEditor();
+});
+
+// ===== 设置页 + 订阅管理（M5 §3.2 / §4.3）=====
+// 常用 arXiv 分类（多选）。不够可后续扩，或留口子手输。
+const ARXIV_CATS = [
+  { id: 'cs.CL', name: 'cs.CL 计算语言' },
+  { id: 'cs.LG', name: 'cs.LG 机器学习' },
+  { id: 'cs.AI', name: 'cs.AI 人工智能' },
+  { id: 'cs.CV', name: 'cs.CV 计算机视觉' },
+  { id: 'cs.IR', name: 'cs.IR 信息检索' },
+  { id: 'cs.RO', name: 'cs.RO 机器人' },
+  { id: 'stat.ML', name: 'stat.ML 统计ML' },
+  { id: 'eess.AS', name: 'eess.AS 音频' },
+];
+let editingSub = null; // null=新增，对象=编辑
+
+function openSettings() {
+  document.getElementById('settings-overlay').classList.add('show');
+  closeSubEditor();
+  renderSubList();
+}
+function closeSettings() {
+  document.getElementById('settings-overlay').classList.remove('show');
+}
+
+async function renderSubList() {
+  const subs = await dbGetAllSubs().catch(() => []);
+  const el = document.getElementById('sub-list');
+  if (!subs.length) {
+    el.innerHTML = '<div class="empty" style="padding:12px 0">还没有订阅。点下方「+ 新增订阅」添加一个 arXiv 分类订阅，日推会每天拉最新投稿。</div>';
+    return;
+  }
+  el.innerHTML = subs.map((s) => {
+    const cats = (s.categories || []).join(', ') || '（无分类）';
+    const kwGroups = (s.keywords || []).filter((g) => g && g.length).map((g) => g.join(' | '));
+    const kw = kwGroups.join('  AND  ');
+    return `<div class="sub-item" data-id="${escapeHtml(s.id)}">
+      <div class="sub-name">${escapeHtml(s.name || '')}<span class="sub-meta">${escapeHtml(cats)}${kw ? ' · ' + escapeHtml(kw) : ''}</span></div>
+      <button class="sub-toggle ${s.enabled ? '' : 'off'}" data-act="toggle">${s.enabled ? '启用' : '停用'}</button>
+      <button class="btn-secondary" data-act="edit" style="flex:0 0 auto;padding:6px 10px;font-size:13px">编辑</button>
+      <button class="btn-secondary" data-act="del" style="flex:0 0 auto;padding:6px 10px;font-size:13px">删</button>
+    </div>`;
+  }).join('');
+}
+
+function openSubEditor(sub) {
+  sub = sub || null;
+  editingSub = sub;
+  document.getElementById('sub-editor-title').textContent = sub ? '编辑订阅' : '新增订阅';
+  document.getElementById('sub-name').value = sub ? (sub.name || '') : '';
+  document.getElementById('sub-enabled').value = sub ? String(!!sub.enabled) : 'true';
+  renderCatPicker(sub ? (sub.categories || []) : []);
+  renderKeywordGroups(sub ? (sub.keywords || []) : []);
+  document.getElementById('sub-editor').style.display = '';
+}
+function closeSubEditor() {
+  document.getElementById('sub-editor').style.display = 'none';
+  editingSub = null;
+}
+
+function renderCatPicker(selected) {
+  const sel = new Set(selected || []);
+  document.getElementById('sub-cats').innerHTML = ARXIV_CATS.map((c) =>
+    `<label><input type="checkbox" value="${escapeHtml(c.id)}" ${sel.has(c.id) ? 'checked' : ''}>${escapeHtml(c.name)}</label>`
+  ).join('');
+}
+
+function renderKeywordGroups(keywords) {
+  const kws = (keywords && keywords.length) ? keywords : [[]];
+  document.getElementById('sub-keywords').innerHTML = kws.map((g) =>
+    `<div class="kw-group"><input class="kw-input" placeholder="关键词，逗号分隔（组内 OR）" value="${escapeHtml((g || []).join(', '))}"><button type="button" class="btn-secondary kw-del" data-act="kw-del">✕</button></div>`
+  ).join('');
+}
+
+async function saveSub() {
+  const name = document.getElementById('sub-name').value.trim();
+  if (!name) { alert('请填写订阅名称'); return; }
+  const categories = [...document.querySelectorAll('#sub-cats input:checked')].map((c) => c.value);
+  if (!categories.length) { alert('请至少选一个 arXiv 分类'); return; }
+  const keywords = [...document.querySelectorAll('#sub-keywords .kw-group')]
+    .map((g) => g.querySelector('.kw-input').value.split(',').map((t) => t.trim()).filter(Boolean))
+    .filter((g) => g.length);
+  const enabled = document.getElementById('sub-enabled').value === 'true';
+  const sub = {
+    id: editingSub ? editingSub.id : uid(),
+    name, keywords, categories, enabled,
+    created_at: editingSub ? (editingSub.created_at || nowISO()) : nowISO(),
+  };
+  try {
+    await dbPutSub(sub);
+    closeSubEditor();
+    renderSubList();
+  } catch (e) {
+    alert('保存订阅失败：' + (e && e.message ? e.message : e));
+  }
+}
+
+async function deleteSub(id) {
+  const subs = await dbGetAllSubs().catch(() => []);
+  const s = subs.find((x) => x.id === id);
+  if (!confirm(`删除订阅「${s ? s.name : id}」？`)) return;
+  await dbDelSub(id).catch(() => {});
+  renderSubList();
+}
+
+async function toggleSub(id) {
+  const subs = await dbGetAllSubs().catch(() => []);
+  const s = subs.find((x) => x.id === id);
+  if (!s) return;
+  s.enabled = !s.enabled;
+  await dbPutSub(s).catch(() => {});
+  renderSubList();
+}
+
+document.getElementById('settings-btn').addEventListener('click', openSettings);
+document.getElementById('settings-close').addEventListener('click', closeSettings);
+document.getElementById('settings-overlay').addEventListener('click', (e) => {
+  if (e.target.id === 'settings-overlay') closeSettings();
+});
+document.getElementById('sub-add').addEventListener('click', () => openSubEditor(null));
+document.getElementById('sub-cancel').addEventListener('click', closeSubEditor);
+document.getElementById('sub-save').addEventListener('click', saveSub);
+document.getElementById('sub-kw-addgrp').addEventListener('click', () => {
+  const el = document.getElementById('sub-keywords');
+  const div = document.createElement('div');
+  div.className = 'kw-group';
+  div.innerHTML = `<input class="kw-input" placeholder="关键词，逗号分隔（组内 OR）"><button type="button" class="btn-secondary kw-del" data-act="kw-del">✕</button>`;
+  el.appendChild(div);
+});
+document.getElementById('sub-list').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-act]');
+  if (!btn) return;
+  const item = btn.closest('.sub-item');
+  if (!item) return;
+  const id = item.dataset.id;
+  const act = btn.dataset.act;
+  if (act === 'edit') {
+    dbGetAllSubs().then((subs) => { const s = subs.find((x) => x.id === id); if (s) openSubEditor(s); });
+  } else if (act === 'del') {
+    deleteSub(id);
+  } else if (act === 'toggle') {
+    toggleSub(id);
+  }
+});
+document.getElementById('sub-keywords').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-act="kw-del"]');
+  if (!btn) return;
+  const grp = btn.closest('.kw-group');
+  if (grp) grp.remove();
 });
 
 document.querySelectorAll('#f-rating span.star').forEach((s) => {
