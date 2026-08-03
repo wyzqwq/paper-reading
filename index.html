@@ -881,7 +881,7 @@ async function save() {
   }
   try {
     await dbPut(paper);
-    // 本地 PDF：有新选文件就写入 pdfFiles（key=paper.id）
+    // 本地 PDF：有新选文件就写入 pdfFiles（key=paper.id，离线缓存）+ 上传 Storage（真相源）
     if (paper.source_type === 'local' && currentFileData) {
       await dbPutFile({
         id: paper.id,
@@ -889,10 +889,14 @@ async function save() {
         size: currentFileData.byteLength,
         added_at: nowISO()
       });
+      // 上传 Storage：同步等待（保证保存完成时云端已存）；失败不阻塞保存，提示用户重试
+      const ok = await sbUploadPdf(paper.id, currentFileData);
+      if (!ok && sbSession()) alert('PDF 已存本地，但上传云端失败。可稍后重新编辑保存以重试上传。');
     }
-    // 来源从 local 改成其它：清理旧 pdfFile，避免孤儿二进制
+    // 来源从 local 改成其它：清理旧 pdfFile + Storage 对象，避免孤儿
     if (paper.source_type !== 'local' && editingId) {
       await dbDeleteFile(paper.id).catch(() => {});
+      if (sbSession()) await sbDeletePdf(paper.id).catch(() => {});
     }
     currentFileData = null;
     currentArxivId = null;
@@ -907,6 +911,7 @@ async function del(p) {
   if (!confirm(`删除「${p.title}」？此操作不可撤销。`)) return;
   await dbDelete(p.id);
   await dbDeleteFile(p.id).catch(() => {}); // 本地 PDF 二进制一并删
+  if (sbSession()) await sbDeletePdf(p.id).catch(() => {}); // Storage 对象一并删
   await dbDeleteAnnosByPaper(p.id).catch(() => {}); // 高亮批注一并删
   render();
 }
@@ -1316,6 +1321,46 @@ async function syncPush() {
   } finally { pushing = false; }
 }
 
+// ===== Supabase Storage：本地 PDF（§3.6/§4.1；bucket=pdfs，路径 <uid>/<paperId>.pdf；arXiv/url 不传）=====
+// IDB pdfFiles 仍作离线缓存保留，Storage 是跨设备真相源。openReader：IDB 优先，缺失 fallback Storage 下载。
+function sbStoragePath(paperId) {
+  const s = sbSession();
+  if (!s) return null;
+  return '/storage/v1/object/pdfs/' + s.user.id + '/' + paperId + '.pdf';
+}
+// 上传：自定义 401 重试（fetch 会 transfer ArrayBuffer，重试需 slice 副本；sbFetch 的重试对 body 无效）
+async function sbUploadPdf(paperId, data) {
+  const s = sbSession();
+  if (!s) return false;
+  const url = SUPABASE_URL + sbStoragePath(paperId);
+  const hdr = (tok) => ({ apikey: SUPABASE_KEY, Authorization: 'Bearer ' + tok, 'Content-Type': 'application/octet-stream', 'x-upsert': 'true' });
+  const backup = data.slice(0); // 防止首次 fetch transfer 后 body detached
+  let res = await fetch(url, { method: 'PUT', headers: hdr(s.access_token), body: data });
+  if (res.status === 401) {
+    const refreshed = await sbRefresh();
+    if (refreshed) res = await fetch(url, { method: 'PUT', headers: hdr(refreshed.access_token), body: backup });
+  }
+  return res.ok;
+}
+async function sbDownloadPdf(paperId) {
+  const s = sbSession();
+  if (!s) return null;
+  const res = await sbFetch(SUPABASE_URL + sbStoragePath(paperId), {
+    headers: { apikey: SUPABASE_KEY, Authorization: 'Bearer ' + s.access_token },
+  });
+  if (!res.ok) return null;
+  return await res.arrayBuffer();
+}
+async function sbDeletePdf(paperId) {
+  const s = sbSession();
+  if (!s) return false;
+  const res = await sbFetch(SUPABASE_URL + sbStoragePath(paperId), {
+    method: 'DELETE',
+    headers: { apikey: SUPABASE_KEY, Authorization: 'Bearer ' + s.access_token },
+  });
+  return res.ok;
+}
+
 // ===== 今日推荐（M5 §4）：拉取 / 打分 / 过滤 / 去重 / 缓存 + 想读 / 跳过 =====
 // 信号（与用户对齐）：时效 recency + 作者亲和 authorAffinity + 关键词密度 keywordDensity
 // 软出现：search_query 只按分类（cat:cs.CL OR ...），关键词降为 app 端打分信号，不进 search_query
@@ -1698,8 +1743,16 @@ async function openReader(paper, jumpPage) {
   let docInit = {};
   if (paper.source_type === 'local') {
     try {
-      const file = await dbGetFile(paper.id);
-      if (!file || !file.data) { alert('本地 PDF 文件缺失（可能在清理或换设备后丢失）。'); return; }
+      let file = await dbGetFile(paper.id);
+      // IDB 缺失：从 Storage 下载（跨设备读本地 PDF 的关键路径），成功后回填 IDB 缓存
+      if ((!file || !file.data) && sbSession()) {
+        const buf = await sbDownloadPdf(paper.id);
+        if (buf) {
+          await dbPutFile({ id: paper.id, data: buf, size: buf.byteLength, added_at: nowISO() });
+          file = { id: paper.id, data: buf };
+        }
+      }
+      if (!file || !file.data) { alert('本地 PDF 文件缺失（本地与云端均无）。'); return; }
       docInit = { data: file.data };
     } catch (e) {
       alert('读取本地 PDF 失败：' + (e && e.message ? e.message : e));
