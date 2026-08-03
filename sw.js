@@ -1,6 +1,6 @@
 // M1 Service Worker：缓存 app 壳。pdf.js（M2 加入预缓存）；wasm/字体运行时缓存。
 // 更新提示（"有更新，点击刷新"）留 M7。
-const CACHE = 'paper-reading-v3';
+const CACHE = 'paper-reading-v4';
 const SHELL = [
   './',
   './index.html',
