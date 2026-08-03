@@ -136,6 +136,15 @@
   .star-input .clr { font-size: 12px; color: var(--muted); margin-left: 8px; cursor: pointer; }
   .url-link { color: var(--accent); text-decoration: none; font-size: 12px; }
   .url-text { color: var(--muted); font-size: 12px; }
+  /* 今日推荐（M5） */
+  .feed-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+  .feed-toolbar .btn-secondary { padding: 6px 12px; font-size: 13px; }
+  .feed-status { color: var(--muted); font-size: 12px; }
+  .feed-card .feed-abs { color: var(--muted); font-size: 13px; margin: 4px 0 6px; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  .feed-card .score-badge { background: #2d4a6e; color: #a8c4ff; }
+  .feed-card .sub-badge { background: var(--surface-2); color: var(--muted); }
+  .feed-card .kw-tag { background: #3a3a4f; color: #c8b8ff; }
+  .feed-card .actions a.url-link { align-self: center; }
   /* 阅读器（M2） */
   .reader {
     position: fixed; inset: 0; background: #2a2a3a; z-index: 40;
@@ -255,7 +264,11 @@
 
 <main>
   <section id="tab-feed" class="tab-panel" style="display:none">
-    <div class="empty">日推功能将在 M5 开发（订阅 arXiv 分类、每日拉取、排序、加入想读/跳过）。当前请先用「阅读队列」手动管理论文。</div>
+    <div class="feed-toolbar">
+      <span id="feed-status" class="feed-status"></span>
+      <button type="button" class="btn-secondary" id="feed-refresh">刷新推荐</button>
+    </div>
+    <div id="list-feed"></div>
   </section>
   <section id="tab-queue" class="tab-panel">
     <div id="list-queue"></div>
@@ -837,6 +850,7 @@ function switchTab(tab) {
   });
   document.querySelectorAll('.tab-panel').forEach((p) => { p.style.display = 'none'; });
   document.getElementById('tab-' + tab).style.display = '';
+  if (tab === 'feed') loadFeed(false); // 进入今日推荐：用缓存或拉取
 }
 
 document.querySelectorAll('nav.tabs button').forEach((b) => {
@@ -999,6 +1013,237 @@ document.getElementById('sub-keywords').addEventListener('click', (e) => {
   if (grp) grp.remove();
 });
 
+// ===== 今日推荐（M5 §4）：拉取 / 打分 / 过滤 / 去重 / 缓存 + 想读 / 跳过 =====
+// 信号（与用户对齐）：时效 recency + 作者亲和 authorAffinity + 关键词密度 keywordDensity
+// 软出现：search_query 只按分类（cat:cs.CL OR ...），关键词降为 app 端打分信号，不进 search_query
+// topK = 15；每订阅拉 100 篇；订阅间 ≥3s 限速（arXiv 礼貌使用）；当日结果缓存到 localStorage
+const FEED_TOP_K = 15;
+const FEED_PER_SUB = 100;
+const FEED_RATE_LIMIT_MS = 3000;
+const FEED_CACHE_PREFIX = 'm5-feed-';
+let feedCache = null; // 今日已打分 items（dismissed/existing 过滤在 render 时实时做）
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+function buildSearchQuery(sub) {
+  // 软出现：仅分类，组间 OR
+  return (sub.categories || []).map((c) => 'cat:' + c).join(' OR ');
+}
+
+async function fetchFeedForSub(sub) {
+  const params = new URLSearchParams({
+    search_query: buildSearchQuery(sub),
+    max_results: String(FEED_PER_SUB),
+    sortBy: 'submittedDate',
+    sortOrder: 'descending',
+  });
+  const res = await fetch(ARXIV_PROXY + '?' + params.toString());
+  if (!res.ok) throw new Error('代理返回 HTTP ' + res.status);
+  const xml = await res.text();
+  return parseArxivXmlList(xml);
+}
+
+// 打分：返回 { score, matchedKws }
+function scorePaper(meta, sub, userAuthors) {
+  // 1) 时效：14 天内线性衰减，>14 天为 0
+  let recency = 0;
+  if (meta.published) {
+    const t = Date.parse(meta.published);
+    if (Number.isFinite(t)) {
+      const days = (Date.now() - t) / 86400000;
+      recency = Math.max(0, 1 - days / 14);
+    }
+  }
+  // 2) 作者亲和：命中用户已跟踪作者 -> 1，否则 0
+  const affAuthors = (meta.authors || []).map((a) => String(a).toLowerCase());
+  const affinity = affAuthors.some((a) => userAuthors.has(a)) ? 1 : 0;
+  // 3) 关键词密度：组内 OR、组间 AND；打分 = 命中组数 / 总组数（无关键词组则 0）
+  const groups = sub.keywords || [];
+  const hay = ((meta.title || '') + ' ' + (meta.abstract || '')).toLowerCase();
+  let matchedGroups = 0;
+  const matchedKws = [];
+  for (const g of groups) {
+    let hit = false;
+    for (const kw of (g || [])) {
+      const k = String(kw).toLowerCase();
+      if (k && hay.includes(k)) {
+        hit = true;
+        if (matchedKws.indexOf(k) < 0) matchedKws.push(k);
+      }
+    }
+    if (hit) matchedGroups++;
+  }
+  const keywordDensity = groups.length ? matchedGroups / groups.length : 0;
+  const score = recency * 1.0 + keywordDensity * 0.6 + affinity * 0.4;
+  return { score, matchedKws };
+}
+
+async function fetchDailyFeed(force) {
+  const today = new Date().toISOString().slice(0, 10);
+  const cacheKey = FEED_CACHE_PREFIX + today;
+  if (!force) {
+    try {
+      const cached = JSON.parse(localStorage.getItem(cacheKey) || 'null');
+      if (cached && Array.isArray(cached.items)) return { items: cached.items, status: 'cached' };
+    } catch (e) {}
+  }
+  const subs = (await dbGetAllSubs().catch(() => [])).filter((s) => s.enabled);
+  if (!subs.length) return { items: [], status: 'no-subs' };
+  const allPapers = await dbAll().catch(() => []);
+  const userAuthors = new Set();
+  allPapers.forEach((p) => (p.authors || []).forEach((a) => userAuthors.add(String(a).toLowerCase())));
+  const dismissed = new Set(await dbGetAllDismissed().catch(() => []));
+  const existingIds = new Set(allPapers.map((p) => p.arxiv_id).filter(Boolean));
+  const seen = new Set();
+  const items = [];
+  for (let i = 0; i < subs.length; i++) {
+    const sub = subs[i];
+    let metas = [];
+    try { metas = await fetchFeedForSub(sub); }
+    catch (e) { continue; } // 单订阅失败不阻断其余
+    for (const meta of metas) {
+      if (!meta.arxiv_id) continue;
+      if (seen.has(meta.arxiv_id)) continue;          // 跨订阅去重
+      seen.add(meta.arxiv_id);
+      if (dismissed.has(meta.arxiv_id)) continue;     // 已跳过
+      if (existingIds.has(meta.arxiv_id)) continue;   // 已在库
+      const s = scorePaper(meta, sub, userAuthors);
+      items.push({
+        arxiv_id: meta.arxiv_id, title: meta.title, authors: meta.authors,
+        abstract: meta.abstract, url: meta.url, tags: meta.tags, published: meta.published,
+        _score: s.score, _matchedKws: s.matchedKws, _sub: sub.name,
+      });
+    }
+    if (i < subs.length - 1) await sleep(FEED_RATE_LIMIT_MS); // arXiv 礼貌限速
+  }
+  items.sort((a, b) => b._score - a._score);
+  const top = items.slice(0, FEED_TOP_K);
+  try { localStorage.setItem(cacheKey, JSON.stringify({ items: top, fetched_at: nowISO() })); } catch (e) {}
+  return { items: top, status: 'ok' };
+}
+
+function setFeedStatus(msg) {
+  const el = document.getElementById('feed-status');
+  if (el) el.textContent = msg || '';
+}
+
+async function loadFeed(force) {
+  const listEl = document.getElementById('list-feed');
+  if (!listEl) return;
+  const subs = (await dbGetAllSubs().catch(() => [])).filter((s) => s.enabled);
+  if (!subs.length) {
+    setFeedStatus('');
+    listEl.innerHTML = '<div class="empty">还没有启用的订阅。先到「⚙ 设置」添加 arXiv 分类订阅，日推会每天拉最新投稿。</div>';
+    feedCache = null;
+    return;
+  }
+  const willFetch = force || !feedCache;
+  if (willFetch) {
+    setFeedStatus(force ? '刷新中…' : '加载中…');
+    listEl.innerHTML = '<div class="empty">正在拉取今日推荐…</div>';
+  }
+  try {
+    const { items, status } = await fetchDailyFeed(force);
+    feedCache = items;
+    if (willFetch) {
+      setFeedStatus(status === 'ok' ? '已更新 · ' + items.length + ' 篇'
+        : (status === 'cached' ? '今日已拉取（缓存）' : ''));
+    }
+  } catch (e) {
+    listEl.innerHTML = '<div class="empty">拉取失败：' + escapeHtml(e && e.message ? e.message : e) + '</div>';
+    setFeedStatus('失败');
+    return;
+  }
+  await renderFeedFromCache();
+}
+
+async function renderFeedFromCache() {
+  const el = document.getElementById('list-feed');
+  if (!el) return;
+  const items = feedCache || [];
+  // 实时过滤：跳过的 / 已在库的（缓存可能早于这些操作，故 render 时再过一遍）
+  const dismissed = new Set(await dbGetAllDismissed().catch(() => []));
+  const allPapers = await dbAll().catch(() => []);
+  const existingIds = new Set(allPapers.map((p) => p.arxiv_id).filter(Boolean));
+  const visible = items.filter((it) => it.arxiv_id && !dismissed.has(it.arxiv_id) && !existingIds.has(it.arxiv_id));
+  renderFeedList(visible);
+}
+
+function renderFeedList(items) {
+  const el = document.getElementById('list-feed');
+  if (!el) return;
+  el.innerHTML = '';
+  if (!items || !items.length) {
+    el.innerHTML = '<div class="empty">今天没有新的推荐（可能已全部看过或跳过）。点「刷新推荐」重试。</div>';
+    return;
+  }
+  items.forEach((item) => el.appendChild(renderFeedCard(item)));
+}
+
+function renderFeedCard(item) {
+  const el = document.createElement('div');
+  el.className = 'card feed-card';
+  const cats = (item.tags || []).slice(0, 4).map((t) => '<span class="tag">' + escapeHtml(t) + '</span>').join('');
+  const kws = (item._matchedKws || []).map((k) => '<span class="tag kw-tag">' + escapeHtml(k) + '</span>').join('');
+  const abs = item.abstract || '';
+  const absExcerpt = abs.slice(0, 200) + (abs.length > 200 ? '…' : '');
+  el.innerHTML =
+    '<div class="title">' + escapeHtml(item.title) + '</div>' +
+    '<div class="authors">' + escapeHtml((item.authors || []).join(', ')) + '</div>' +
+    (absExcerpt ? '<div class="feed-abs">' + escapeHtml(absExcerpt) + '</div>' : '') +
+    '<div class="meta">' +
+      '<span class="badge score-badge">推荐 ' + item._score.toFixed(2) + '</span>' +
+      (item._sub ? '<span class="badge sub-badge">' + escapeHtml(item._sub) + '</span>' : '') +
+      cats + kws +
+    '</div>' +
+    '<div class="actions">' +
+      '<button class="btn-primary" data-act="want">加入想读</button>' +
+      '<button class="btn-secondary" data-act="skip">跳过</button>' +
+      (item.url ? '<a class="url-link" href="' + escapeHtml(item.url) + '" target="_blank" rel="noopener">arXiv ↗</a>' : '') +
+    '</div>';
+  el.querySelector('[data-act="want"]').addEventListener('click', () => feedWant(item));
+  el.querySelector('[data-act="skip"]').addEventListener('click', () => feedSkip(item));
+  return el;
+}
+
+async function feedWant(item) {
+  try {
+    const paper = {
+      id: uid(),
+      title: item.title,
+      authors: item.authors || [],
+      abstract: item.abstract || null,
+      source_type: 'arxiv',
+      arxiv_id: item.arxiv_id,
+      url: item.url,
+      local_file_path: null,
+      status: 'want',
+      rating: null,
+      tags: item.tags || [],
+      notes_md: '',
+      read_progress: 0,
+      added_at: nowISO(),
+      updated_at: nowISO(),
+    };
+    await dbPut(paper);
+    render(); // 刷新阅读队列
+    await renderFeedFromCache(); // 从日推移除该篇（已在库 -> existingIds 过滤）
+  } catch (e) {
+    alert('加入想读失败：' + (e && e.message ? e.message : e));
+  }
+}
+
+async function feedSkip(item) {
+  try {
+    await dbPutDismiss(item.arxiv_id);
+    await renderFeedFromCache(); // dismissed 过滤后该篇消失
+  } catch (e) {
+    alert('跳过失败：' + (e && e.message ? e.message : e));
+  }
+}
+
+document.getElementById('feed-refresh').addEventListener('click', () => loadFeed(true));
+
 document.querySelectorAll('#f-rating span.star').forEach((s) => {
   s.addEventListener('click', () => { currentRating = Number(s.dataset.v); renderStars(); });
 });
@@ -1047,13 +1292,7 @@ function textByTagNS(el, ns, tag) {
   return n ? (n.textContent || '').trim() : '';
 }
 
-function parseArxivXml(xml) {
-  const doc = new DOMParser().parseFromString(xml, 'application/xml');
-  if (doc.getElementsByTagName('parsererror').length) {
-    throw new Error('arXiv 返回非合法 XML');
-  }
-  const entry = doc.getElementsByTagNameNS(ATOM_NS, 'entry')[0];
-  if (!entry) throw new Error('arXiv 未返回条目（ID 可能无效或被限流）');
+function parseArxivEntry(entry) {
   // id 形如 http://arxiv.org/abs/1706.03762v2 -> 取 abs/ 后、去版本号
   const idText = textByTagNS(entry, ATOM_NS, 'id');
   const aidMatch = idText.match(/abs\/(.+?)(?:v\d+)?$/i);
@@ -1072,14 +1311,36 @@ function parseArxivXml(xml) {
     const t = catEls[i].getAttribute('term');
     if (t) tags.push(t);
   }
+  // published（M5 时效打分用）：形如 2026-08-01T00:00:00Z
+  const published = textByTagNS(entry, ATOM_NS, 'published');
   return {
     arxiv_id,
     title,
     authors,
     abstract: summary,
     url: arxiv_id ? ('https://arxiv.org/abs/' + arxiv_id) : '',
-    tags
+    tags,
+    published,
   };
+}
+
+// M5 日推：解析多 entry（搜索结果）。返回数组（无条目时为 []）
+function parseArxivXmlList(xml) {
+  const doc = new DOMParser().parseFromString(xml, 'application/xml');
+  if (doc.getElementsByTagName('parsererror').length) {
+    throw new Error('arXiv 返回非合法 XML');
+  }
+  const entries = doc.getElementsByTagNameNS(ATOM_NS, 'entry');
+  const list = [];
+  for (let i = 0; i < entries.length; i++) list.push(parseArxivEntry(entries[i]));
+  return list;
+}
+
+function parseArxivXml(xml) {
+  // M3 导入：取首条（保持原行为）
+  const list = parseArxivXmlList(xml);
+  if (!list.length) throw new Error('arXiv 未返回条目（ID 可能无效或被限流）');
+  return list[0];
 }
 
 async function fetchArxiv() {
