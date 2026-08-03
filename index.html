@@ -1022,6 +1022,7 @@ const FEED_PER_SUB = 100;
 const FEED_RATE_LIMIT_MS = 3000;
 const FEED_CACHE_PREFIX = 'm5-feed-';
 let feedCache = null; // 今日已打分 items（dismissed/existing 过滤在 render 时实时做）
+let feedFreshness = null; // 'updated'（刚拉取）/ 'cached'（当日缓存）/ null
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
@@ -1135,6 +1136,7 @@ async function loadFeed(force) {
     setFeedStatus('');
     listEl.innerHTML = '<div class="empty">还没有启用的订阅。先到「⚙ 设置」添加 arXiv 分类订阅，日推会每天拉最新投稿。</div>';
     feedCache = null;
+    feedFreshness = null;
     return;
   }
   const willFetch = force || !feedCache;
@@ -1145,10 +1147,7 @@ async function loadFeed(force) {
   try {
     const { items, status } = await fetchDailyFeed(force);
     feedCache = items;
-    if (willFetch) {
-      setFeedStatus(status === 'ok' ? '已更新 · ' + items.length + ' 篇'
-        : (status === 'cached' ? '今日已拉取（缓存）' : ''));
-    }
+    if (willFetch) feedFreshness = (status === 'cached') ? 'cached' : 'updated';
   } catch (e) {
     listEl.innerHTML = '<div class="empty">拉取失败：' + escapeHtml(e && e.message ? e.message : e) + '</div>';
     setFeedStatus('失败');
@@ -1167,6 +1166,9 @@ async function renderFeedFromCache() {
   const existingIds = new Set(allPapers.map((p) => p.arxiv_id).filter(Boolean));
   const visible = items.filter((it) => it.arxiv_id && !dismissed.has(it.arxiv_id) && !existingIds.has(it.arxiv_id));
   renderFeedList(visible);
+  // 状态显示当前可见数（want/skip 后同步更新，避免计数陈旧）
+  const label = feedFreshness === 'cached' ? '缓存' : '已更新';
+  setFeedStatus(visible.length > 0 ? label + ' · ' + visible.length + ' 篇' : '');
 }
 
 function renderFeedList(items) {
