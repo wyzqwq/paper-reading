@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#1a1a2e">
+<meta name="theme-color" content="#1a1814">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="论文阅读">
@@ -11,17 +11,17 @@
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <title>论文阅读</title>
 <style>
-  /* 占位深色主题（M7 定稿）。配色 token 暂定：bg #1a1a2e / text #d4d4e0 / accent #6c8cff */
+  /* M7 定稿深色主题「墨纸」：暖墨黑底 + 古铜金 accent，旧书页反相 + 烫金题字感，蓝光少护眼 */
   :root {
-    --bg: #1a1a2e;
-    --surface: #242440;
-    --surface-2: #2c2c4f;
-    --text: #d4d4e0;
-    --muted: #8a8aa3;
-    --accent: #6c8cff;
-    --accent-h: #5a7ae8;
-    --border: #2e2e4f;
-    --danger: #e06c6c;
+    --bg: #1a1814;
+    --surface: #24211c;
+    --surface-2: #2e2a23;
+    --text: #e8e3d8;
+    --muted: #8a8478;
+    --accent: #c9a96e;
+    --accent-h: #b8975a;
+    --border: #322e26;
+    --danger: #c66b5a;
     --radius: 8px;
   }
   * { box-sizing: border-box; }
@@ -56,10 +56,10 @@
   .card .authors { color: var(--muted); font-size: 13px; margin-bottom: 6px; }
   .card .meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 12px; }
   .badge { padding: 2px 8px; border-radius: 10px; font-size: 11px; }
-  .badge.status-want { background: #3a3a5f; color: var(--text); }
-  .badge.status-reading { background: #2d4a6e; color: #a8c4ff; }
-  .badge.status-done { background: #2d4e3a; color: #a8e8c4; }
-  .badge.status-abandoned { background: #4e2d2d; color: #e8a8a8; }
+  .badge.status-want { background: #3a342a; color: var(--text); }
+  .badge.status-reading { background: #3a3220; color: #c9a96e; }
+  .badge.status-done { background: #2d3a2a; color: #a8c89a; }
+  .badge.status-abandoned { background: #4a2d2a; color: #d8a8a8; }
   .tag { background: var(--surface-2); color: var(--muted); padding: 1px 6px; border-radius: 8px; font-size: 11px; }
   .stars { color: var(--accent); letter-spacing: 1px; }
   .card .url-line { margin-top: 6px; word-break: break-all; }
@@ -206,7 +206,7 @@
     transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
   }
   .textLayer .markedContent { display: contents; }
-  .textLayer ::selection { background: rgba(108,140,255,0.35); }
+  .textLayer ::selection { background: rgba(201,169,110,0.35); }
   .textLayer mark.hl {
     color: transparent; border-radius: 1px; padding: 0; cursor: pointer;
   }
@@ -395,8 +395,8 @@
   <div class="reader-scroll" id="reader-scroll"></div>
   <!-- 选中文字弹出的高亮/批注菜单（M4） -->
   <div class="hl-menu" id="hl-menu" style="display:none">
-    <button type="button" class="hl-swatch" data-color="yellow" style="background:rgba(255,204,64,0.55)" title="黄" aria-label="黄"></button>
-    <button type="button" class="hl-swatch" data-color="cyan" style="background:rgba(34,211,238,0.55)" title="青" aria-label="青"></button>
+    <button type="button" class="hl-swatch" data-color="yellow" style="background:rgba(232,196,106,0.55)" title="黄" aria-label="黄"></button>
+    <button type="button" class="hl-swatch" data-color="cyan" style="background:rgba(111,168,212,0.55)" title="青" aria-label="青"></button>
     <input type="text" id="hl-note" placeholder="批注（可选）">
     <button type="button" class="btn-primary" id="hl-save">高亮</button>
     <button type="button" class="hl-delete" id="hl-delete" style="display:none">删除</button>
@@ -2055,9 +2055,9 @@ function saveReaderProgressNow() {
 }
 
 // ===== 高亮批注（M4）=====
-// 高亮双色：黄 + 青（cyan）。选中色 ::selection 仍用 App 强调蓝 rgba(108,140,255)，
-// 与青色高亮区分开（旧版用蓝高亮和选中同色，选中时分不清）。'blue' 为旧数据兼容，回退到青。
-const HIGHLIGHT_COLORS = { yellow: 'rgba(255,204,64,0.45)', cyan: 'rgba(34,211,238,0.45)' };
+// 高亮双色：黄 + 蓝。选中色 ::selection 用 accent 古铜金 rgba(201,169,110)，
+// 与蓝色高亮区分开。'blue' 为旧数据兼容，回退到蓝（cyan）。
+const HIGHLIGHT_COLORS = { yellow: 'rgba(232,196,106,0.45)', cyan: 'rgba(111,168,212,0.45)' };
 let currentHlColor = 'yellow';
 
 // 应用某页全部高亮：先清旧 mark 再按偏移重包（缩放/增删后重画）
