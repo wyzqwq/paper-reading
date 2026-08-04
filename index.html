@@ -1873,6 +1873,7 @@ async function openReader(paper, jumpPage) {
     scrollEl.addEventListener('touchstart', onReaderTouchStart, { passive: true });
     scrollEl.addEventListener('touchmove', onReaderTouchMove, { passive: true });
     scrollEl.addEventListener('touchend', onReaderTouchEnd, { passive: true });
+    window.addEventListener('unhandledrejection', onReaderUnhandledRej);
   } catch (e) {
     scrollEl.innerHTML = '<div class="reader-error">PDF 加载失败：' +
       escapeHtml(e && e.message || String(e)) +
@@ -1963,6 +1964,10 @@ async function renderTextLayer(canvas, cssScale) {
   const rs = readerState;
   if (!rs) return; // closeReader 后 pending renderPage 可能仍调用此函数，readerState 已 null（与 applyHighlights 守卫一致）
   const pageNum = canvas._pageNum;
+  // M7 诊断：iOS 上 spanCount=0，记录各阶段 + tc 结构，定位卡在哪步（render() 内部 pump 抛错会卡住，见 onReaderUnhandledRej）
+  rs.tlErrors = rs.tlErrors || [];
+  const trace = { pageNum, steps: [] };
+  rs.tlErrors.push(trace);
   try {
     const page = canvas._page;
     const vpCss = page.getViewport({ scale: cssScale });
@@ -1971,16 +1976,28 @@ async function renderTextLayer(canvas, cssScale) {
     // pdf.js v6 TextLayer 的 font-size/容器尺寸算式依赖 --total-scale-factor（= viewport.scale），
     // 不设则 calc 失效、容器塌成 0×0 + overflow:hidden 把 span 全裁掉 -> 文字选不中
     container.style.setProperty('--total-scale-factor', cssScale);
+    trace.steps.push('factor');
     let tc = rs.textContentCache[pageNum];
     if (!tc) {
       // M7: includeMarkedContent 对齐官方 TextLayerBuilder（streamTextContent 默认带），结构/无障碍语义一致
       tc = await page.getTextContent({ includeMarkedContent: true });
       rs.textContentCache[pageNum] = tc;
+      trace.steps.push('getTextContent');
+    } else {
+      trace.steps.push('cachedTC');
     }
+    trace.itemsLen = tc && tc.items ? tc.items.length : 0;
+    trace.stylesLen = tc && tc.styles ? Object.keys(tc.styles).length : 0;
     const tl = new pdfjsLib.TextLayer({
       textContentSource: tc, container, viewport: vpCss, textDivs: []
     });
-    try { await tl.render(); } catch (e) { /* 缩放/关闭取消，忽略 */ }
+    trace.steps.push('newTextLayer');
+    try {
+      await tl.render();
+      trace.steps.push('renderDone');
+    } catch (e) {
+      trace.steps.push('renderCatch:' + (e && e.message || e));
+    }
     // 显式覆盖容器尺寸：setLayerDimensions 用 round()（旧浏览器可能不支持），且确保与 canvas 像素对齐
     container.style.width = Math.round(vpCss.width) + 'px';
     container.style.height = Math.round(vpCss.height) + 'px';
@@ -1995,10 +2012,10 @@ async function renderTextLayer(canvas, cssScale) {
     }
     rs.textLayers[pageNum] = { layer: tl, container, textDivs: tl.textDivs || [], endOfContent: eoc };
     canvas._tlScale = cssScale;
+    trace.spanCount = container.querySelectorAll('span').length;
+    trace.steps.push('done');
   } catch (e) {
-    // M7 诊断：iOS 上 textLayer span 不渲染（spanCount=0），捕获 renderTextLayer 各阶段错误供诊断面板读取
-    rs.tlErrors = rs.tlErrors || [];
-    rs.tlErrors.push({ pageNum, name: e && e.name, msg: e && e.message, stack: String((e && e.stack) || '').slice(0, 400) });
+    trace.steps.push('OUTER:' + (e && e.name || '') + ':' + (e && e.message || ''));
   }
 }
 
@@ -2118,6 +2135,20 @@ function readerZoom(delta, targetZoom) {
   });
 }
 
+// M7 诊断：TextLayer.render 内部 pump 用 .then() 链，#appendText/#processItems 同步抛错会变 unhandled rejection，
+// #capability 不 resolve/reject -> await tl.render() 永远卡住，外层 try-catch 抓不到。这里抓 reason 供诊断面板读取。
+function onReaderUnhandledRej(e) {
+  const rs = readerState;
+  if (!rs) return;
+  rs.tlErrors = rs.tlErrors || [];
+  const r = e && e.reason;
+  rs.tlErrors.push({
+    unhandled: true,
+    msg: String((r && (r.message || r)) || r || '').slice(0, 300),
+    stack: String((r && r.stack) || '').slice(0, 500)
+  });
+}
+
 function closeReader() {
   const rs = readerState;
   if (rs) {
@@ -2139,6 +2170,7 @@ function closeReader() {
       rs.scrollEl.removeEventListener('touchstart', onReaderTouchStart);
       rs.scrollEl.removeEventListener('touchmove', onReaderTouchMove);
       rs.scrollEl.removeEventListener('touchend', onReaderTouchEnd);
+      window.removeEventListener('unhandledrejection', onReaderUnhandledRej);
     }
   }
   hideHlMenu();
@@ -2178,7 +2210,18 @@ function diagReader() {
     canvasTlScale: canvas ? canvas._tlScale : 'n/a',
     textContentCached: rs && rs.textContentCache ? !!rs.textContentCache[1] : 'n/a',
     textLayers1Exists: rs && rs.textLayers ? !!rs.textLayers[1] : 'n/a',
-    tlErrors: rs && rs.tlErrors ? rs.tlErrors : 'none',
+    tlErrors: (() => {
+      if (!rs || !rs.tlErrors || !rs.tlErrors.length) return 'none';
+      const traces = rs.tlErrors.filter((t) => t.steps);
+      const unhandled = rs.tlErrors.filter((t) => t.unhandled);
+      const lastP1 = [...traces].reverse().find((t) => t.pageNum === 1) || traces[traces.length - 1];
+      return {
+        lastTrace: lastP1 || 'none',
+        unhandledCount: unhandled.length,
+        lastUnhandled: unhandled.length ? unhandled[unhandled.length - 1] : 'none',
+        totalEntries: rs.tlErrors.length,
+      };
+    })(),
     tlOverflow: tl ? getComputedStyle(tl).overflow : 'n/a',
     tlTabindex: tl ? tl.tabIndex : 'n/a',
     tlZIndex: tl ? getComputedStyle(tl).zIndex : 'n/a',
