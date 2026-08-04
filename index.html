@@ -1963,37 +1963,43 @@ async function renderTextLayer(canvas, cssScale) {
   const rs = readerState;
   if (!rs) return; // closeReader 后 pending renderPage 可能仍调用此函数，readerState 已 null（与 applyHighlights 守卫一致）
   const pageNum = canvas._pageNum;
-  const page = canvas._page;
-  const vpCss = page.getViewport({ scale: cssScale });
-  const container = canvas._textLayerDiv;
-  container.innerHTML = '';
-  // pdf.js v6 TextLayer 的 font-size/容器尺寸算式依赖 --total-scale-factor（= viewport.scale），
-  // 不设则 calc 失效、容器塌成 0×0 + overflow:hidden 把 span 全裁掉 -> 文字选不中
-  container.style.setProperty('--total-scale-factor', cssScale);
-  let tc = rs.textContentCache[pageNum];
-  if (!tc) {
-    // M7: includeMarkedContent 对齐官方 TextLayerBuilder（streamTextContent 默认带），结构/无障碍语义一致
-    tc = await page.getTextContent({ includeMarkedContent: true });
-    rs.textContentCache[pageNum] = tc;
+  try {
+    const page = canvas._page;
+    const vpCss = page.getViewport({ scale: cssScale });
+    const container = canvas._textLayerDiv;
+    container.innerHTML = '';
+    // pdf.js v6 TextLayer 的 font-size/容器尺寸算式依赖 --total-scale-factor（= viewport.scale），
+    // 不设则 calc 失效、容器塌成 0×0 + overflow:hidden 把 span 全裁掉 -> 文字选不中
+    container.style.setProperty('--total-scale-factor', cssScale);
+    let tc = rs.textContentCache[pageNum];
+    if (!tc) {
+      // M7: includeMarkedContent 对齐官方 TextLayerBuilder（streamTextContent 默认带），结构/无障碍语义一致
+      tc = await page.getTextContent({ includeMarkedContent: true });
+      rs.textContentCache[pageNum] = tc;
+    }
+    const tl = new pdfjsLib.TextLayer({
+      textContentSource: tc, container, viewport: vpCss, textDivs: []
+    });
+    try { await tl.render(); } catch (e) { /* 缩放/关闭取消，忽略 */ }
+    // 显式覆盖容器尺寸：setLayerDimensions 用 round()（旧浏览器可能不支持），且确保与 canvas 像素对齐
+    container.style.width = Math.round(vpCss.width) + 'px';
+    container.style.height = Math.round(vpCss.height) + 'px';
+    // endOfContent（pdf.js v6 核心 TextLayer.render 不自动加，TextLayerBuilder 才创建）：
+    // 配合 onReaderSelectionChange 的 Safari 分支动态挪位 + .selecting 类作 user-select:none 屏障
+    let eoc = container.querySelector('.endOfContent');
+    if (!eoc) {
+      eoc = document.createElement('div');
+      eoc.className = 'endOfContent';
+      eoc.setAttribute('aria-hidden', 'true');
+      container.appendChild(eoc);
+    }
+    rs.textLayers[pageNum] = { layer: tl, container, textDivs: tl.textDivs || [], endOfContent: eoc };
+    canvas._tlScale = cssScale;
+  } catch (e) {
+    // M7 诊断：iOS 上 textLayer span 不渲染（spanCount=0），捕获 renderTextLayer 各阶段错误供诊断面板读取
+    rs.tlErrors = rs.tlErrors || [];
+    rs.tlErrors.push({ pageNum, name: e && e.name, msg: e && e.message, stack: String((e && e.stack) || '').slice(0, 400) });
   }
-  const tl = new pdfjsLib.TextLayer({
-    textContentSource: tc, container, viewport: vpCss, textDivs: []
-  });
-  try { await tl.render(); } catch (e) { /* 缩放/关闭取消，忽略 */ }
-  // 显式覆盖容器尺寸：setLayerDimensions 用 round()（旧浏览器可能不支持），且确保与 canvas 像素对齐
-  container.style.width = Math.round(vpCss.width) + 'px';
-  container.style.height = Math.round(vpCss.height) + 'px';
-  // endOfContent（pdf.js v6 核心 TextLayer.render 不自动加，TextLayerBuilder 才创建）：
-  // 配合 onReaderSelectionChange 的 Safari 分支动态挪位 + .selecting 类作 user-select:none 屏障
-  let eoc = container.querySelector('.endOfContent');
-  if (!eoc) {
-    eoc = document.createElement('div');
-    eoc.className = 'endOfContent';
-    eoc.setAttribute('aria-hidden', 'true');
-    container.appendChild(eoc);
-  }
-  rs.textLayers[pageNum] = { layer: tl, container, textDivs: tl.textDivs || [], endOfContent: eoc };
-  canvas._tlScale = cssScale;
 }
 
 function currentReaderPage() {
@@ -2168,6 +2174,11 @@ function diagReader() {
     spanRect: r ? { w: Math.round(r.width), h: Math.round(r.height), x: Math.round(r.x), y: Math.round(r.y) } : 'n/a',
     hitAtSpanCenter: hitSpan,
     canvasRect: cr ? { w: Math.round(cr.width), h: Math.round(cr.height), x: Math.round(cr.x), y: Math.round(cr.y) } : 'n/a',
+    canvasRenderedScale: canvas ? canvas._renderedScale : 'n/a',
+    canvasTlScale: canvas ? canvas._tlScale : 'n/a',
+    textContentCached: rs && rs.textContentCache ? !!rs.textContentCache[1] : 'n/a',
+    textLayers1Exists: rs && rs.textLayers ? !!rs.textLayers[1] : 'n/a',
+    tlErrors: rs && rs.tlErrors ? rs.tlErrors : 'none',
     tlOverflow: tl ? getComputedStyle(tl).overflow : 'n/a',
     tlTabindex: tl ? tl.tabIndex : 'n/a',
     tlZIndex: tl ? getComputedStyle(tl).zIndex : 'n/a',
