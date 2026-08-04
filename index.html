@@ -115,12 +115,16 @@
   .sub-item .sub-name .sub-meta { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; word-break: break-all; }
   .sub-item .sub-toggle { font-size: 12px; cursor: pointer; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
   .sub-item .sub-toggle.off { color: var(--muted); }
-  .cat-picker { display: flex; flex-wrap: wrap; gap: 6px; }
+  .cat-picker { display: flex; flex-direction: column; gap: 10px; }
+  .cat-group { display: flex; flex-direction: column; gap: 4px; }
+  .cat-group-title { font-size: 11px; color: var(--muted); font-weight: 600; }
+  .cat-group-chips { display: flex; flex-wrap: wrap; gap: 6px; }
   .cat-picker label {
     font-size: 12px; display: flex; align-items: center; gap: 4px; margin: 0;
     padding: 5px 10px; border: 1px solid var(--border); border-radius: 14px; cursor: pointer; color: var(--text);
   }
-  .cat-picker input { width: auto; }
+  .cat-picker input[type=checkbox] { width: auto; }
+  .cat-picker input[type=text] { flex: 1; font-size: 12px; padding: 6px 10px; }
   .kw-group { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
   .kw-group input { flex: 1; }
   .kw-group .kw-del { flex: 0 0 auto; padding: 8px 12px; font-size: 14px; }
@@ -972,16 +976,50 @@ document.getElementById('overlay').addEventListener('click', (e) => {
 });
 
 // ===== 设置页 + 订阅管理（M5 §3.2 / §4.3）=====
-// 常用 arXiv 分类（多选）。不够可后续扩，或留口子手输。
-const ARXIV_CATS = [
-  { id: 'cs.CL', name: 'cs.CL 计算语言' },
-  { id: 'cs.LG', name: 'cs.LG 机器学习' },
-  { id: 'cs.AI', name: 'cs.AI 人工智能' },
-  { id: 'cs.CV', name: 'cs.CV 计算机视觉' },
-  { id: 'cs.IR', name: 'cs.IR 信息检索' },
-  { id: 'cs.RO', name: 'cs.RO 机器人' },
-  { id: 'stat.ML', name: 'stat.ML 统计ML' },
-  { id: 'eess.AS', name: 'eess.AS 音频' },
+// 常用 arXiv 分类（按领域分组多选）+ 自定义手输（任意 arXiv 分类，如 q-bio.NC）。
+// 完整分类见 https://arxiv.org/category_taxonomy
+const ARXIV_CAT_GROUPS = [
+  { group: 'cs 计算机', cats: [
+    { id: 'cs.CL', name: 'cs.CL 计算语言' },
+    { id: 'cs.LG', name: 'cs.LG 机器学习' },
+    { id: 'cs.AI', name: 'cs.AI 人工智能' },
+    { id: 'cs.CV', name: 'cs.CV 计算机视觉' },
+    { id: 'cs.IR', name: 'cs.IR 信息检索' },
+    { id: 'cs.RO', name: 'cs.RO 机器人' },
+    { id: 'cs.NE', name: 'cs.NE 神经与演化计算' },
+    { id: 'cs.HC', name: 'cs.HC 人机交互' },
+    { id: 'cs.DB', name: 'cs.DB 数据库' },
+    { id: 'cs.SE', name: 'cs.SE 软件工程' },
+  ]},
+  { group: 'q-bio 定量生物', cats: [
+    { id: 'q-bio.NC', name: 'q-bio.NC 神经与认知' },
+    { id: 'q-bio.QM', name: 'q-bio.QM 定量方法' },
+    { id: 'q-bio.CB', name: 'q-bio.CB 细胞行为' },
+    { id: 'q-bio.MN', name: 'q-bio.MN 分子网络' },
+    { id: 'q-bio.OT', name: 'q-bio.OT 其他' },
+  ]},
+  { group: 'stat 统计', cats: [
+    { id: 'stat.ML', name: 'stat.ML 统计ML' },
+    { id: 'stat.TH', name: 'stat.TH 理论统计' },
+    { id: 'stat.AP', name: 'stat.AP 应用统计' },
+    { id: 'stat.CO', name: 'stat.CO 计算' },
+  ]},
+  { group: 'math 数学', cats: [
+    { id: 'math.DS', name: 'math.DS 动力系统' },
+    { id: 'math.PR', name: 'math.PR 概率' },
+    { id: 'math.ST', name: 'math.ST 统计理论' },
+    { id: 'math.OC', name: 'math.OC 优化控制' },
+    { id: 'math.NA', name: 'math.NA 数值分析' },
+  ]},
+  { group: 'eess 电子', cats: [
+    { id: 'eess.AS', name: 'eess.AS 音频' },
+    { id: 'eess.IV', name: 'eess.IV 图像视频' },
+    { id: 'eess.SP', name: 'eess.SP 信号处理' },
+  ]},
+  { group: 'nlin 非线性', cats: [
+    { id: 'nlin.AO', name: 'nlin.AO 自适应与自组织' },
+    { id: 'nlin.CD', name: 'nlin.CD 元胞自动机' },
+  ]},
 ];
 let editingSub = null; // null=新增，对象=编辑
 
@@ -1032,9 +1070,20 @@ function closeSubEditor() {
 
 function renderCatPicker(selected) {
   const sel = new Set(selected || []);
-  document.getElementById('sub-cats').innerHTML = ARXIV_CATS.map((c) =>
-    `<label><input type="checkbox" value="${escapeHtml(c.id)}" ${sel.has(c.id) ? 'checked' : ''}>${escapeHtml(c.name)}</label>`
+  // 预设分组 checkbox
+  const groupsHtml = ARXIV_CAT_GROUPS.map((g) =>
+    `<div class="cat-group"><div class="cat-group-title">${escapeHtml(g.group)}</div><div class="cat-group-chips">` +
+    g.cats.map((c) =>
+      `<label><input type="checkbox" value="${escapeHtml(c.id)}" ${sel.has(c.id) ? 'checked' : ''}>${escapeHtml(c.name)}</label>`
+    ).join('') + `</div></div>`
   ).join('');
+  // 自定义手输：已保存但不在预设列表里的分类回填到输入框
+  const presetIds = new Set(ARXIV_CAT_GROUPS.flatMap((g) => g.cats.map((c) => c.id)));
+  const custom = [...sel].filter((id) => !presetIds.has(id));
+  document.getElementById('sub-cats').innerHTML = groupsHtml +
+    `<div class="cat-group"><div class="cat-group-title">自定义分类</div>` +
+    `<input type="text" id="sub-cat-custom" placeholder="手输 arXiv 分类，逗号分隔（如 q-bio.NC, stat.AP）" value="${escapeHtml(custom.join(', '))}">` +
+    `<div style="font-size:11px;color:var(--muted);margin-top:4px">完整分类见 arxiv.org/category_taxonomy</div></div>`;
 }
 
 function renderKeywordGroups(keywords) {
@@ -1047,7 +1096,10 @@ function renderKeywordGroups(keywords) {
 async function saveSub() {
   const name = document.getElementById('sub-name').value.trim();
   if (!name) { alert('请填写订阅名称'); return; }
-  const categories = [...document.querySelectorAll('#sub-cats input:checked')].map((c) => c.value);
+  const checked = [...document.querySelectorAll('#sub-cats input[type=checkbox]:checked')].map((c) => c.value);
+  const customEl = document.getElementById('sub-cat-custom');
+  const custom = customEl ? customEl.value.split(',').map((t) => t.trim()).filter(Boolean) : [];
+  const categories = [...new Set([...checked, ...custom])];
   if (!categories.length) { alert('请至少选一个 arXiv 分类'); return; }
   const keywords = [...document.querySelectorAll('#sub-keywords .kw-group')]
     .map((g) => g.querySelector('.kw-input').value.split(',').map((t) => t.trim()).filter(Boolean))
