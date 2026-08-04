@@ -23,6 +23,9 @@
     --border: #322e26;
     --danger: #c66b5a;
     --radius: 8px;
+    --jade: #8fb3a8;                          /* v2 翻译：旧玉柔青，ZH 译文文字色 */
+    --jade-bg: rgba(143, 179, 168, 0.20);     /* v2 翻译：点句高亮底色 */
+    --jade-line: rgba(143, 179, 168, 0.45);   /* v2 翻译：已译句极淡下划线 */
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); }
@@ -241,6 +244,23 @@
   .textLayer mark.hl {
     color: transparent; border-radius: 1px; padding: 0; cursor: pointer;
   }
+  /* v2 翻译：已译句可点叠层（极淡 jade 下划线提示可点）+ 点句高亮底 + ZH 浮层 */
+  .textLayer span.tr-sent {
+    cursor: pointer; border-radius: 1px;
+    border-bottom: 1px solid var(--jade-line);
+    -webkit-tap-highlight-color: transparent;
+  }
+  .textLayer span.tr-sent.tr-active { background: var(--jade-bg); border-bottom-color: var(--jade); }
+  .reader-tr-popup {
+    position: fixed; z-index: 60; max-width: 84vw;
+    background: var(--surface-2); color: var(--jade);
+    border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 14px; font-size: 15px; line-height: 1.5;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.5);
+    -webkit-tap-highlight-color: transparent;
+  }
+  .reader-translate-btn[aria-pressed="true"] { background: var(--accent); color: #fff; }
+  .reader-tr-status { color: var(--muted); font-size: 12px; margin-left: 4px; }
   /* 高亮菜单（M4） */
   .hl-menu {
     position: fixed; z-index: 50; display: flex; align-items: center; gap: 6px;
@@ -455,6 +475,8 @@
       <button type="button" class="btn-primary" id="reader-notes-save">保存</button>
     </div>
   </div>
+  <!-- v2 翻译：点句弹出的 ZH 译文浮层（仅译文） -->
+  <div class="reader-tr-popup" id="reader-tr-popup" style="display:none" role="status" aria-live="polite"></div>
 </div>
 
 <script>
@@ -2198,6 +2220,7 @@ async function renderPage(canvas) {
   if (canvas._tlScale !== cssScale) {
     await renderTextLayer(canvas, cssScale);
     applyHighlights(canvas._pageNum);
+    trApplyPage(canvas._pageNum); // v2：textLayer 重建后重铺译文叠层（缩放/懒渲染）
   }
 }
 
@@ -2320,6 +2343,7 @@ function onReaderScroll() {
   document.getElementById('reader-progress-fill').style.width = (Math.max(0, Math.min(1, frac)) * 100) + '%';
   if (rs.saveTimer) clearTimeout(rs.saveTimer);
   rs.saveTimer = setTimeout(() => saveReaderProgress(frac), 500);
+  trHidePopup(); // v2：滚动即收起 ZH 浮层（浮层 fixed 定位不随内容滚）
 }
 
 async function saveReaderProgress(frac) {
@@ -2592,10 +2616,193 @@ function trCancel() {
   if (rs && rs.tr) { rs.tr.cancelled = true; rs.tr.enabled = false; }
 }
 
-// Task6 钩子（叠层渲染）：Task5 预译完一页调 trApplyPage；Task6 实现真正的偏移->span 映射 + 点句叠层
-function trApplyPage(pageNum) { /* Task6 */ }
-function trHideAll() { /* Task6：隐藏所有译文叠层 + ZH 浮层 */ }
+// ===== Task6：点句叠层 + ZH 浮层（句子偏移 -> span 映射，复用 M4 TreeWalker 偏移机制）=====
+// trApplyPage(pageNum)：该页 pairs 就绪后，把每句 en 在 textLayer 里定位 [start,end) 字符偏移，
+//   包成 <span class="tr-sent" data-pair="i"> 片段（同句跨多个 textLayer span 则多片段，共享 data-pair）。
+//   匹配失败的句降级为不可点（不崩，§11.6）。点句弹 ZH 浮层（仅译文，§11.10）。
+// 偏移基准：textLayer live 文本 = 各 span 文本节点拼接（<br> 无文本）；与 trExtractPageText 喂 LLM 的
+//   items 文本唯一差异是 hasEOL 处的 \n（live 无 \n）。故 en 去 \n 后通常能直接 indexOf 命中。
+
+// 取某页 textLayer 的 live 文本 + 归一化映射（空白折叠，兜底匹配用）
+function trBuildTextMap(pageNum) {
+  const rs = readerState;
+  const tl = rs && rs.textLayers && rs.textLayers[pageNum];
+  if (!tl) return null;
+  const walker = document.createTreeWalker(tl.container, NodeFilter.SHOW_TEXT);
+  let raw = '';
+  while (walker.nextNode()) raw += walker.currentNode.nodeValue;
+  if (!raw) return null;
+  // 归一化：空白 runs 折叠为单空格，记每个 norm 字符对应的 raw 起始偏移
+  let norm = '';
+  const rawStart = [];
+  const isWs = (c) => c === ' ' || c === '\n' || c === '\t' || c === '\r' || c === '\f' || c === '\v';
+  let i = 0;
+  while (i < raw.length) {
+    if (isWs(raw[i])) {
+      norm += ' '; rawStart.push(i);
+      while (i < raw.length && isWs(raw[i])) i++;
+    } else {
+      norm += raw[i]; rawStart.push(i); i++;
+    }
+  }
+  return { raw, norm, rawStart };
+}
+
+// 在 map.raw 里从 fromPos 起找 en 句的 [start,end)。三级匹配：原样 -> 去 \n -> 归一化空白
+function trFindOffset(map, en, fromPos) {
+  if (!map || !en) return null;
+  let idx = map.raw.indexOf(en, fromPos);
+  if (idx >= 0) return { start: idx, end: idx + en.length };
+  // live 文本无 \n（<br> 无文本），en 跨行处的 \n 去掉再匹配
+  const enNonl = en.replace(/\n/g, '');
+  if (enNonl) {
+    idx = map.raw.indexOf(enNonl, fromPos);
+    if (idx >= 0) return { start: idx, end: idx + enNonl.length };
+  }
+  // 兜底：归一化空白匹配（en 与 live 间有空格差异）
+  const enNorm = en.replace(/\s+/g, ' ').trim();
+  if (enNorm) {
+    const nPos = map.norm.indexOf(enNorm);
+    if (nPos >= 0) {
+      const start = map.rawStart[nPos];
+      const end = (map.rawStart[nPos + enNorm.length - 1] || start) + 1;
+      return { start, end };
+    }
+  }
+  return null;
+}
+
+// 把 [start,end) 包成 tr-sent 片段（同 M4 wrapTextRange 的 TreeWalker 分段，但用 span + data-pair，
+// 留在各自 textLayer span 内继承 --font-height/--scale-x）
+function trWrapSentence(pageEl, start, end, pairIdx) {
+  if (end <= start) return false;
+  const walker = document.createTreeWalker(pageEl, NodeFilter.SHOW_TEXT);
+  const segs = [];
+  let cur = 0, node;
+  while ((node = walker.nextNode())) {
+    const len = node.nodeValue.length;
+    if (cur + len <= start) { cur += len; continue; }
+    if (cur >= end) break;
+    segs.push({ node, localStart: Math.max(0, start - cur), localEnd: Math.min(len, end - cur) });
+    cur += len;
+  }
+  if (!segs.length) return false;
+  let any = false;
+  for (const s of segs) {
+    if (s.localEnd <= s.localStart) continue;
+    const range = document.createRange();
+    range.setStart(s.node, s.localStart);
+    range.setEnd(s.node, s.localEnd);
+    const span = document.createElement('span');
+    span.className = 'tr-sent';
+    span.dataset.pair = String(pairIdx);
+    try { range.surroundContents(span); any = true; }
+    catch (e) {
+      try { const frag = range.extractContents(); span.appendChild(frag); range.insertNode(span); any = true; }
+      catch (e2) { /* 跳过该段 */ }
+    }
+  }
+  return any;
+}
+
+// 清某 pageEl 内所有 tr-sent 片段（unwrap，还原文本）
+function trUnwrapPage(pageEl) {
+  if (!pageEl) return;
+  pageEl.querySelectorAll('span.tr-sent').forEach((sp) => {
+    const parent = sp.parentNode;
+    while (sp.firstChild) parent.insertBefore(sp.firstChild, sp);
+    parent.removeChild(sp);
+    parent.normalize();
+  });
+}
+
+// 应用某页译文叠层（pairs 就绪后调；缩放重建 textLayer 后也调）
+function trApplyPage(pageNum) {
+  const rs = readerState;
+  if (!rs || !rs.tr || !rs.tr.enabled) return;
+  const pg = rs.tr.pages[pageNum];
+  if (!pg || !pg.ready || !Array.isArray(pg.pairs) || !pg.pairs.length) return;
+  const tl = rs.textLayers && rs.textLayers[pageNum];
+  if (!tl) return; // 该页 textLayer 未渲染（懒渲染：滚到才画）；之后 renderPage 会补调
+  const pageEl = tl.container;
+  trUnwrapPage(pageEl); // 清旧（重译/重铺）
+  const map = trBuildTextMap(pageNum);
+  if (!map) return;
+  let pos = 0, matched = 0;
+  for (let i = 0; i < pg.pairs.length; i++) {
+    const en = pg.pairs[i] && pg.pairs[i].en;
+    const found = trFindOffset(map, en, pos);
+    if (found) { trWrapSentence(pageEl, found.start, found.end, i); pos = found.end; matched++; }
+    // 匹配失败：该句不可点，pos 不动（下一句从同位置继续找）
+  }
+  pg.matched = matched;
+}
+
+// 隐藏所有译文叠层 + ZH 浮层（关开关 / 关阅读器）
+function trHideAll() {
+  const rs = readerState;
+  if (rs && rs.textLayers) {
+    for (const k in rs.textLayers) trUnwrapPage(rs.textLayers[k].container);
+  }
+  trHidePopup();
+}
+
 function trApplyError(msg) { toast(msg, 4000); }
+
+// ---- ZH 浮层（仅译文）----
+let trActivePair = null; // { pageNum, idx }
+function trHidePopup() {
+  const pop = document.getElementById('reader-tr-popup');
+  if (pop) pop.style.display = 'none';
+  if (trActivePair && readerState && readerState.textLayers) {
+    const tl = readerState.textLayers[trActivePair.pageNum];
+    if (tl) tl.container.querySelectorAll('span.tr-sent.tr-active').forEach((s) => s.classList.remove('tr-active'));
+  }
+  trActivePair = null;
+}
+function trShowPopup(pageNum, pairIdx, anchorEl) {
+  const rs = readerState;
+  if (!rs || !rs.tr) return;
+  const pg = rs.tr.pages[pageNum];
+  if (!pg || !pg.pairs || !pg.pairs[pairIdx]) return;
+  const zh = pg.pairs[pairIdx].zh || '';
+  const pop = document.getElementById('reader-tr-popup');
+  if (!pop) return;
+  trHidePopup(); // 清上一处
+  pop.textContent = zh;
+  pop.style.display = 'block';
+  const tl = rs.textLayers && rs.textLayers[pageNum];
+  if (tl) tl.container.querySelectorAll('span.tr-sent[data-pair="' + pairIdx + '"]').forEach((s) => s.classList.add('tr-active'));
+  trActivePair = { pageNum, idx: pairIdx };
+  // 定位：锚点片段视口矩形下方居中；不够则上方；再夹在视口内
+  const r = anchorEl.getBoundingClientRect();
+  const pw = pop.offsetWidth, ph = pop.offsetHeight;
+  let left = r.left + r.width / 2 - pw / 2;
+  let top = r.bottom + 8;
+  if (top + ph > window.innerHeight - 8) top = r.top - ph - 8;
+  left = Math.max(8, Math.min(left, window.innerWidth - pw - 8));
+  top = Math.max(8, top);
+  pop.style.left = Math.round(left) + 'px';
+  pop.style.top = Math.round(top) + 'px';
+}
+
+// 点句弹 ZH 浮层（事件委托）；选区展开时让位 M4 高亮菜单
+function onReaderTrClick(e) {
+  const rs = readerState;
+  if (!rs || !rs.tr || !rs.tr.enabled) return;
+  const sent = e.target && e.target.closest ? e.target.closest('span.tr-sent') : null;
+  if (!sent) { trHidePopup(); return; }
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed) return; // 拖选中，让 M4 接管
+  let pageNum = null;
+  for (const k in rs.textLayers) {
+    if (rs.textLayers[k].container.contains(sent)) { pageNum = +k; break; }
+  }
+  if (pageNum == null) return;
+  const pairIdx = +sent.dataset.pair;
+  trShowPopup(pageNum, pairIdx, sent);
+}
+
 
 // ===== 高亮批注（M4）=====
 // 高亮双色：黄 + 蓝。选中色 ::selection 用 accent 古铜金 rgba(201,169,110)，
@@ -2911,6 +3118,7 @@ document.getElementById('reader-zoom-in').addEventListener('click', () => reader
 document.getElementById('reader-zoom-out').addEventListener('click', () => readerZoom(1 / 1.2));
 document.getElementById('reader-notes-btn').addEventListener('click', toggleReaderNotes);
 document.getElementById('reader-translate-btn').addEventListener('click', () => toggleTranslate());
+document.getElementById('reader-scroll').addEventListener('click', onReaderTrClick); // v2：点句弹 ZH
 document.getElementById('reader-notes-close').addEventListener('click', () => {
   document.getElementById('reader-notes').style.display = 'none';
 });
