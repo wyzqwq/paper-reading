@@ -166,6 +166,10 @@
   .reader-progress { flex: 1; height: 6px; background: var(--surface-2); border-radius: 3px; overflow: hidden; }
   .reader-progress > div { height: 100%; background: var(--accent); width: 0%; transition: width 0.1s; }
   .reader-zoom { display: flex; gap: 4px; }
+  .reader-diag { font-size: 13px; padding: 4px 8px; }
+  #diag-box { position: fixed; top: 50px; left: 8px; right: 8px; bottom: 8px;
+    background: #fff; color: #000; font: 11px/1.45 monospace; padding: 10px;
+    overflow: auto; z-index: 9999; display: none; white-space: pre-wrap; word-break: break-all; }
   .reader-scroll {
     flex: 1; overflow-y: auto; overflow-x: auto; padding: 12px 0;
     display: flex; flex-direction: column; align-items: flex-start; gap: 12px;
@@ -418,8 +422,10 @@
       <button id="reader-zoom-in" aria-label="放大">＋</button>
     </div>
     <button class="reader-notes-btn" id="reader-notes-btn" aria-label="笔记">笔记</button>
+    <button class="reader-diag" id="reader-diag" aria-label="诊断">诊</button>
   </div>
   <div class="reader-scroll" id="reader-scroll"></div>
+  <div id="diag-box" aria-hidden="true"></div>
   <!-- 选中文字弹出的高亮/批注菜单（M4） -->
   <div class="hl-menu" id="hl-menu" style="display:none">
     <button type="button" class="hl-swatch" data-color="yellow" style="background:rgba(232,196,106,0.55)" title="黄" aria-label="黄"></button>
@@ -2136,6 +2142,51 @@ function closeReader() {
   render(); // 刷新列表（read_progress / notes 已写回）
 }
 
+// M7 iOS 选词诊断面板（临时，定位后删）：点"诊"显示 textLayer 真实渲染状态 + 命中点 + UA，
+// 供 haiku 读图定位 iOS 选词失败分支（chromium 测不出 WKTextInteraction 行为）
+function diagReader() {
+  const rs = readerState;
+  const tl = document.querySelector('.textLayer[data-page-num="1"]');
+  const spans = tl ? [...tl.querySelectorAll('span')].filter((s) => s.textContent.trim().length > 0) : [];
+  const span0 = spans[0];
+  const cs = span0 ? getComputedStyle(span0) : null;
+  const r = span0 ? span0.getBoundingClientRect() : null;
+  let hitSpan = 'n/a';
+  if (span0 && r && r.width > 0 && r.height > 0) {
+    const el = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    hitSpan = el ? (el.tagName + (el.className ? '.' + String(el.className).slice(0, 20) : '')) : 'null';
+  }
+  const eoc = tl ? tl.querySelector('.endOfContent') : null;
+  const canvas = document.querySelector('#reader-scroll canvas');
+  const cr = canvas ? canvas.getBoundingClientRect() : null;
+  const info = {
+    ua: navigator.userAgent.slice(0, 140),
+    spanCount: spans.length,
+    spanFontSize: cs ? cs.fontSize : 'n/a',
+    spanColor: cs ? cs.color : 'n/a',
+    spanTransform: cs ? String(cs.transform).slice(0, 60) : 'n/a',
+    spanRect: r ? { w: Math.round(r.width), h: Math.round(r.height), x: Math.round(r.x), y: Math.round(r.y) } : 'n/a',
+    hitAtSpanCenter: hitSpan,
+    canvasRect: cr ? { w: Math.round(cr.width), h: Math.round(cr.height), x: Math.round(cr.x), y: Math.round(cr.y) } : 'n/a',
+    tlOverflow: tl ? getComputedStyle(tl).overflow : 'n/a',
+    tlTabindex: tl ? tl.tabIndex : 'n/a',
+    tlZIndex: tl ? getComputedStyle(tl).zIndex : 'n/a',
+    tlTotalScaleFactor: tl ? tl.style.getPropertyValue('--total-scale-factor') : 'n/a',
+    tlHasSelecting: tl ? tl.classList.contains('selecting') : 'n/a',
+    eocExists: !!eoc,
+    eocInlineUserSelect: eoc ? (eoc.style.userSelect || '(empty)') : 'n/a',
+    eocIsLastChild: (tl && eoc) ? (eoc === tl.lastElementChild) : 'n/a',
+    zoom: rs ? rs.zoom : 'n/a',
+    scrollElTouchAction: rs ? getComputedStyle(rs.scrollEl).touchAction : 'n/a',
+    windowSize: window.innerWidth + 'x' + window.innerHeight,
+    dpr: window.devicePixelRatio,
+  };
+  const box = document.getElementById('diag-box');
+  if (!box) return;
+  box.textContent = JSON.stringify(info, null, 2);
+  box.style.display = 'block';
+}
+
 function saveReaderProgressNow() {
   const rs = readerState;
   if (!rs || !rs.paper) return;
@@ -2459,6 +2510,11 @@ async function saveReaderNotes() {
 document.getElementById('reader-close').addEventListener('click', closeReader);
 document.getElementById('reader-zoom-in').addEventListener('click', () => readerZoom(1.2));
 document.getElementById('reader-zoom-out').addEventListener('click', () => readerZoom(1 / 1.2));
+document.getElementById('reader-diag').addEventListener('click', () => {
+  const box = document.getElementById('diag-box');
+  if (box.style.display === 'block') { box.style.display = 'none'; return; }
+  diagReader();
+});
 document.getElementById('reader-notes-btn').addEventListener('click', toggleReaderNotes);
 document.getElementById('reader-notes-close').addEventListener('click', () => {
   document.getElementById('reader-notes').style.display = 'none';
