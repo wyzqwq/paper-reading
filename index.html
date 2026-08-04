@@ -445,7 +445,7 @@
 <script>
 // ===== IndexedDB：papers + pdfFiles + annotations（M3 加 pdfFiles，M4 加 annotations；§4.1/§4.2 子集；M6 接 Supabase 同步）=====
 const DB_NAME = 'paper-reading';
-const DB_VERSION = 5; // v5：M6 同步 -- papers/annotations/subscriptions 加 deleted_at 软删除（tombstone）+ anno/sub 加 updated_at（IndexedDB schemaless，无结构迁移，旧对象读取时 deleted_at=undefined 视为未删）
+const DB_VERSION = 6; // v6：v2 翻译 -- translations(逐页译文缓存)+ user_secrets(DeepSeek key) 两 store；schemaless 无结构迁移，旧库升 v6 时建空 store，syncPull 填充
 let db = null;
 
 function openDB() {
@@ -492,6 +492,16 @@ function openDB() {
             c.continue();
           };
         }
+      }
+      // v6：v2 翻译 -- translations(逐页译文缓存,§11.4) + user_secrets(DeepSeek key,§11.3)
+      // translations: {id,user_id,paper_id,scope:'page',page_num,pairs:[{en,zh}],source_hash,updated_at,deleted_at,_dirty}
+      // user_secrets: {user_id,deepseek_key,updated_at,_dirty} 单行/用户
+      if (!d.objectStoreNames.contains('translations')) {
+        const tr = d.createObjectStore('translations', { keyPath: 'id' });
+        tr.createIndex('paper_id', 'paper_id', { unique: false });
+      }
+      if (!d.objectStoreNames.contains('user_secrets')) {
+        d.createObjectStore('user_secrets', { keyPath: 'user_id' });
       }
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
@@ -689,6 +699,76 @@ function dbIsDismissed(arxivId) {
   return new Promise((resolve, reject) => {
     const req = dismissStore('readonly').get(arxivId);
     req.onsuccess = () => resolve(!!req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// translations store（v2 §11.4）：逐页译文缓存。key=id(uuid)，索引 paper_id
+// {id, user_id, paper_id, scope:'page', page_num, pairs:[{en,zh}], source_hash, updated_at, deleted_at, _dirty}
+function trStore(mode) { return db.transaction('translations', mode).objectStore('translations'); }
+
+// 写/更新一页译文（同 paper+page 复用既有 id 更新，不产生重复行；source_hash 变则重译覆盖）
+function dbPutTranslation(t) {
+  if (!t.updated_at) t.updated_at = nowISO();
+  if (!t.scope) t.scope = 'page';
+  t._dirty = true;
+  return new Promise((resolve, reject) => {
+    const req = trStore('readwrite').put(t);
+    req.onsuccess = () => { schedulePush(); resolve(t); };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// 取某页译文：同 paper 多行（多设备可能各译一次）取未删的最新一条
+function dbGetTranslation(paperId, pageNum) {
+  return new Promise((resolve, reject) => {
+    const idx = trStore('readonly').index('paper_id');
+    const req = idx.getAll(paperId);
+    req.onsuccess = () => {
+      const rows = (req.result || []).filter((r) => !r.deleted_at && r.page_num === pageNum);
+      rows.sort((a, b) => tsOf(b.updated_at) - tsOf(a.updated_at));
+      resolve(rows[0] || null);
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// 取某篇全部已译页（reader 预译时读缓存；同 page 取最新）
+function dbGetAllTranslations(paperId) {
+  return new Promise((resolve, reject) => {
+    const idx = trStore('readonly').index('paper_id');
+    const req = idx.getAll(paperId);
+    req.onsuccess = () => {
+      const rows = (req.result || []).filter((r) => !r.deleted_at);
+      const byPage = {};
+      for (const r of rows) {
+        const k = r.page_num;
+        if (!byPage[k] || tsOf(r.updated_at) > tsOf(byPage[k].updated_at)) byPage[k] = r;
+      }
+      resolve(Object.values(byPage));
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// user_secrets store（v2 §11.3）：DeepSeek key，单行/用户。key=user_id
+// {user_id, deepseek_key, updated_at, _dirty}；跨设备共享（Mac 填过 iPhone 不用重填）
+function secretStore(mode) { return db.transaction('user_secrets', mode).objectStore('user_secrets'); }
+
+function dbPutSecret(row) {
+  if (!row.updated_at) row.updated_at = nowISO();
+  row._dirty = true;
+  return new Promise((resolve, reject) => {
+    const req = secretStore('readwrite').put(row);
+    req.onsuccess = () => { schedulePush(); resolve(row); };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function dbGetSecret(userId) {
+  return new Promise((resolve, reject) => {
+    const req = secretStore('readonly').get(userId);
+    req.onsuccess = () => resolve(req.result || null);
     req.onerror = () => reject(req.error);
   });
 }
@@ -1292,6 +1372,7 @@ const SYNC_TABLES = [
   { table: 'papers', store: 'papers' },
   { table: 'annotations', store: 'annotations' },
   { table: 'subscriptions', store: 'subscriptions' },
+  { table: 'translations', store: 'translations' }, // v2 翻译：逐页译文缓存,uuid id 走通用 LWW
 ];
 let pushTimer = null;
 
@@ -1370,6 +1451,19 @@ async function syncPull() {
       for (const row of rows) await rawPut('dismissed', { arxiv_id: row.arxiv_id, dismissed_at: row.dismissed_at });
     }
   } catch (e) { console.warn('pull dismissed err:', e.message); }
+  // user_secrets（v2）：单行/用户，LWW 拉取缓存（跨设备共享 DeepSeek key）
+  try {
+    const sres = await sbFetch(SB_REST + '/user_secrets?select=*', { headers });
+    if (sres.ok) {
+      const rows = await sres.json();
+      for (const row of rows) {
+        const local = await rawGet('user_secrets', row.user_id);
+        if (!local || tsOf(row.updated_at) > tsOf(local.updated_at)) {
+          await rawPut('user_secrets', row); // rawPut 设 _dirty=false
+        }
+      }
+    }
+  } catch (e) { console.warn('pull user_secrets err:', e.message); }
   render();
 }
 
@@ -1415,6 +1509,25 @@ async function syncPush() {
         });
         if (res.ok) { for (const d of dDirty) { d._dirty = false; await rawPut('dismissed', d); } }
       } catch (e) { console.warn('push dismissed err:', e.message); }
+    }
+    // user_secrets（v2）：单行，on_conflict=user_id（payload 不含 deleted_at，该表无此列）
+    const secret = await rawGetAll('user_secrets');
+    const sDirty = secret.filter((r) => r._dirty === true);
+    if (sDirty.length) {
+      const payload = sDirty.map((r) => ({
+        user_id: r.user_id || userId,
+        deepseek_key: r.deepseek_key || '',
+        updated_at: r.updated_at,
+      }));
+      try {
+        const res = await sbFetch(SB_REST + '/user_secrets?on_conflict=user_id', {
+          method: 'POST',
+          headers: Object.assign({}, headers, { Prefer: 'resolution=merge-duplicates' }),
+          body: JSON.stringify(payload),
+        });
+        if (res.ok) { for (const r of sDirty) { r._dirty = false; await rawPut('user_secrets', r); } }
+        else { console.warn('push user_secrets:', res.status, await res.text()); }
+      } catch (e) { console.warn('push user_secrets err:', e.message); }
     }
   } finally { pushing = false; }
 }
