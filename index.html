@@ -8,7 +8,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="论文阅读">
 <link rel="manifest" href="manifest.webmanifest">
-<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
 <title>论文阅读</title>
 <style>
   /* M7 定稿深色主题「墨纸」：暖墨黑底 + 古铜金 accent，旧书页反相 + 烫金题字感，蓝光少护眼 */
@@ -912,7 +912,7 @@ async function save() {
   }
   try {
     await dbPut(paper);
-    // 本地 PDF：有新选文件就写入 pdfFiles（key=paper.id，离线缓存）+ 上传 Storage（真相源）
+    // 本地 PDF：有新选文件就写入 pdfFiles（key=paper.id，离线缓存）
     if (paper.source_type === 'local' && currentFileData) {
       await dbPutFile({
         id: paper.id,
@@ -920,19 +920,27 @@ async function save() {
         size: currentFileData.byteLength,
         added_at: nowISO()
       });
-      // 上传 Storage：同步等待（保证保存完成时云端已存）；失败不阻塞保存，提示用户重试
-      const ok = await sbUploadPdf(paper.id, currentFileData);
-      if (!ok && sbSession()) alert('PDF 已存本地，但上传云端失败。可稍后重新编辑保存以重试上传。');
     }
-    // 来源从 local 改成其它：清理旧 pdfFile + Storage 对象，避免孤儿
+    // 来源从 local 改成其它：清理旧 pdfFile + Storage 对象（Storage 删除非阻塞，失败不阻塞 UI）
     if (paper.source_type !== 'local' && editingId) {
       await dbDeleteFile(paper.id).catch(() => {});
-      if (sbSession()) await sbDeletePdf(paper.id).catch(() => {});
+      if (sbSession()) sbDeletePdf(paper.id).catch(() => {});
     }
+    // M8 修复：本地保存成功后立即关编辑器 + render。Storage 上传改后台非阻塞
+    // （之前 await sbUploadPdf 挂起/抛错会导致论文已存但添加页面不关）。
+    const uploadFile = currentFileData;
+    const uploadId = paper.id;
     currentFileData = null;
     currentArxivId = null;
     closeEditor();
     render();
+    if (paper.source_type === 'local' && uploadFile && sbSession()) {
+      sbUploadPdf(uploadId, uploadFile).then((ok) => {
+        if (!ok) alert('PDF 已存本地，但上传云端失败。可稍后重新编辑保存以重试上传。');
+      }).catch(() => {
+        alert('PDF 已存本地，但上传云端失败。可稍后重新编辑保存以重试上传。');
+      });
+    }
   } catch (err) {
     alert('保存失败：' + (err && err.message ? err.message : err));
   }
@@ -1425,12 +1433,21 @@ async function sbUploadPdf(paperId, data) {
   const url = SUPABASE_URL + sbStoragePath(paperId);
   const hdr = (tok) => ({ apikey: SUPABASE_KEY, Authorization: 'Bearer ' + tok, 'Content-Type': 'application/octet-stream', 'x-upsert': 'true' });
   const backup = data.slice(0); // 防止首次 fetch transfer 后 body detached
-  let res = await fetch(url, { method: 'PUT', headers: hdr(s.access_token), body: data });
-  if (res.status === 401) {
-    const refreshed = await sbRefresh();
-    if (refreshed) res = await fetch(url, { method: 'PUT', headers: hdr(refreshed.access_token), body: backup });
+  // M8 修复：2 分钟超时，防网络卡住导致上传永不返回（save 已改后台非阻塞，但避免 promise 悬空）
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 120000);
+  try {
+    let res = await fetch(url, { method: 'PUT', headers: hdr(s.access_token), body: data, signal: ctrl.signal });
+    if (res.status === 401) {
+      const refreshed = await sbRefresh();
+      if (refreshed) res = await fetch(url, { method: 'PUT', headers: hdr(refreshed.access_token), body: backup, signal: ctrl.signal });
+    }
+    return res.ok;
+  } catch (e) {
+    return false; // 超时/网络错误 -> 视为上传失败（save 侧提示用户重试）
+  } finally {
+    clearTimeout(timer);
   }
-  return res.ok;
 }
 async function sbDownloadPdf(paperId) {
   const s = sbSession();
@@ -2556,6 +2573,16 @@ document.getElementById('hl-save').addEventListener('click', () => {
 document.getElementById('hl-delete').addEventListener('click', deleteHighlight);
 
 // ===== Service Worker 注册 + 更新提示（M7）=====
+// M8：iOS Safari「添加到主屏」用 manifest 图标，但把相对路径解析到域名根，
+// 子路径部署（GitHub Pages /<repo>/）下会 404。运行时把 apple-touch-icon
+// 设成基于当前 location 的绝对路径（兼容 LAN 根路径与 GitHub Pages 子路径）。
+// manifest 图标的绝对化在 sw.js fetch 拦截里做（保持 manifest URL 为真实同源 URL）。
+(function () {
+  const base = location.pathname.replace(/[^/]*$/, ''); // '/' 或 '/paper-reading/'
+  const ico = document.querySelector('link[rel=apple-touch-icon]');
+  if (ico) ico.href = base + 'icons/apple-touch-icon.png';
+})();
+
 if ('serviceWorker' in navigator) {
   let refreshing = false;
   const hadController = !!navigator.serviceWorker.controller; // 注册前是否有旧 SW（区分首次注册 vs 版本更新）
