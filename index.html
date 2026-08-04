@@ -169,9 +169,10 @@
   .reader-scroll {
     flex: 1; overflow-y: auto; overflow-x: auto; padding: 12px 0;
     display: flex; flex-direction: column; align-items: flex-start; gap: 12px;
-    -webkit-overflow-scrolling: touch;
-    touch-action: pan-x pan-y; /* M7：允许双向滚动 + 禁止浏览器原生 pinch-zoom，但不禁止长按选词；
-      配合 touch 监听改 passive:true，避免 passive:false 干扰 iOS 长按手势识别（选词放大镜不弹） */
+    /* M7: -webkit-overflow-scrolling:touch 已删（官方 viewerContainer 无此属性，iOS 13+ 已废弃且
+       历史上引发子元素 hit-test/选区怪癖，fable 对抗审查点名）。touch-action:pan-x pan-y 暂保留
+       （pinch 缩放依赖它禁止浏览器原生 pinch-zoom），待实机验证 Safari endOfContent 重定位修复后再 A/B。 */
+    touch-action: pan-x pan-y;
   }
   .reader-page { display: flex; justify-content: center; position: relative; margin: 0 auto; }
   .reader-page canvas {
@@ -223,7 +224,9 @@
   .textLayer ::selection { background: rgba(201,169,110,0.35); }
   /* pdf.js endOfContent：约束选区在 textLayer 内，拖到边界时扩展到页末而不是跳到 UI（顶栏"笔记"按钮等）。
      pdf.js v6 核心 TextLayer.render 不创建该 div（TextLayerBuilder 才创建），本应用在 renderTextLayer 手动 append。
-     z-index:0 对齐官方 text_layer_builder.css（非 -1）。selecting 时仅设 top:0 作 user-select:none 屏障。 */
+     z-index:0 对齐官方 text_layer_builder.css（非 -1）。.selecting 时 top:0 让 endOfContent 盖满整层；
+     但 onReaderSelectionChange 的 Safari 分支会 inline 设 userSelect:'text' 覆盖此处的 user-select:none，
+     并把它挪到 anchor 旁，使选区扩展时端点落在紧邻 anchor 的可选元素而非逃逸到 UI（官方同设计）。 */
   .textLayer .endOfContent {
     display: block; position: absolute; inset: 100% 0 0; z-index: 0;
     cursor: default; -webkit-user-select: none; user-select: none;
@@ -1852,10 +1855,18 @@ async function openReader(paper, jumpPage) {
     // 选区监听用 selectionchange（非 mouseup）：iOS 选文本松手时系统接管触摸、mouseup 不触发；
     // 改听 document selectionchange + 防抖 300ms，松手后选区稳定即弹高亮菜单，鼠标/触摸通用
     document.addEventListener('selectionchange', onReaderSelectionChange);
+    // M7: 复刻官方 TextLayerBuilder.#enableGlobalSelectionListener 的 reset 监听：
+    // pointerup/blur/keyup 时把 endOfContent 归位 + 移除 .selecting，避免 user-select:none 屏障常驻干扰后续选词
+    document.addEventListener('pointerdown', onReaderPointerDown, { passive: true });
+    document.addEventListener('pointerup', onReaderPointerUp, { passive: true });
+    window.addEventListener('blur', onReaderWinBlur);
+    document.addEventListener('keyup', onReaderKeyUp, { passive: true });
     scrollEl.addEventListener('click', onReaderClick);
+    // M7: touch 监听全 passive（onReaderTouch* 只管 pinch，从不 preventDefault）。
+    // 第5轮漏改 touchend 仍 passive:false，按当时理论会干扰 iOS 长按选词手势识别，补齐。
     scrollEl.addEventListener('touchstart', onReaderTouchStart, { passive: true });
     scrollEl.addEventListener('touchmove', onReaderTouchMove, { passive: true });
-    scrollEl.addEventListener('touchend', onReaderTouchEnd);
+    scrollEl.addEventListener('touchend', onReaderTouchEnd, { passive: true });
   } catch (e) {
     scrollEl.innerHTML = '<div class="reader-error">PDF 加载失败：' +
       escapeHtml(e && e.message || String(e)) +
@@ -1966,15 +1977,16 @@ async function renderTextLayer(canvas, cssScale) {
   // 显式覆盖容器尺寸：setLayerDimensions 用 round()（旧浏览器可能不支持），且确保与 canvas 像素对齐
   container.style.width = Math.round(vpCss.width) + 'px';
   container.style.height = Math.round(vpCss.height) + 'px';
-  // endOfContent（pdf.js v6 TextLayerBuilder 才会创建，核心 TextLayer.render 不自动加）：
-  // 配合 .selecting 类让该 div 覆盖 textLayer 作 user-select:none 屏障，约束选区不跨到 UI（顶栏"笔记"按钮等）
-  if (!container.querySelector('.endOfContent')) {
-    const eoc = document.createElement('div');
+  // endOfContent（pdf.js v6 核心 TextLayer.render 不自动加，TextLayerBuilder 才创建）：
+  // 配合 onReaderSelectionChange 的 Safari 分支动态挪位 + .selecting 类作 user-select:none 屏障
+  let eoc = container.querySelector('.endOfContent');
+  if (!eoc) {
+    eoc = document.createElement('div');
     eoc.className = 'endOfContent';
     eoc.setAttribute('aria-hidden', 'true');
     container.appendChild(eoc);
   }
-  rs.textLayers[pageNum] = { layer: tl, container, textDivs: tl.textDivs || [] };
+  rs.textLayers[pageNum] = { layer: tl, container, textDivs: tl.textDivs || [], endOfContent: eoc };
   canvas._tlScale = cssScale;
 }
 
@@ -2107,6 +2119,10 @@ function closeReader() {
     if (rs.scrollEl) {
       rs.scrollEl.removeEventListener('scroll', onReaderScroll);
       document.removeEventListener('selectionchange', onReaderSelectionChange);
+      document.removeEventListener('pointerdown', onReaderPointerDown);
+      document.removeEventListener('pointerup', onReaderPointerUp);
+      window.removeEventListener('blur', onReaderWinBlur);
+      document.removeEventListener('keyup', onReaderKeyUp);
       rs.scrollEl.removeEventListener('click', onReaderClick);
       rs.scrollEl.removeEventListener('touchstart', onReaderTouchStart);
       rs.scrollEl.removeEventListener('touchmove', onReaderTouchMove);
@@ -2201,6 +2217,10 @@ function captureSelection(pageEl) {
   // 也防选区跨到顶栏 UI 如"笔记"按钮 -> offset 算成整页+UI）
   if (!pageEl.contains(range.startContainer) || !pageEl.contains(range.endContainer)) return null;
   if (range.startContainer === pageEl || range.endContainer === pageEl) return null;
+  // M7: 端点落在 endOfContent（Safari 分支挪到 anchor 旁的 user-select:text 屏障）会算出垃圾偏移 -> 整页高亮，放弃
+  const eoc = pageEl.querySelector('.endOfContent');
+  if (eoc && (eoc === range.startContainer || eoc === range.endContainer ||
+              eoc.contains(range.startContainer) || eoc.contains(range.endContainer))) return null;
   const startR = document.createRange();
   startR.selectNodeContents(pageEl);
   startR.setEnd(range.startContainer, range.startOffset);
@@ -2216,19 +2236,84 @@ function captureSelection(pageEl) {
 }
 
 let selChangeTimer = null;
+let selPrevRange = null; // 官方 prevRange：判断用户在拖选区哪一端（modifyStart）
+let readerSelPointerDown = false;
+
+// 官方 TextLayerBuilder.#enableGlobalSelectionListener.reset：把 endOfContent 归位到 textLayer 末尾
+// + 清 inline 尺寸 + 移除 .selecting。松手/失焦/keyup 时调用，避免 user-select:none 屏障常驻。
+function resetReaderTextLayer(tlInfo) {
+  if (!tlInfo || !tlInfo.endOfContent) return;
+  tlInfo.container.append(tlInfo.endOfContent);
+  tlInfo.endOfContent.style.width = '';
+  tlInfo.endOfContent.style.height = '';
+  tlInfo.container.classList.remove('selecting');
+}
+function resetAllReaderTextLayers() {
+  const rs = readerState;
+  if (!rs) return;
+  for (const k in rs.textLayers) resetReaderTextLayer(rs.textLayers[k]);
+  selPrevRange = null;
+}
+function onReaderPointerDown() { readerSelPointerDown = true; }
+function onReaderPointerUp() { readerSelPointerDown = false; resetAllReaderTextLayers(); }
+function onReaderWinBlur() { readerSelPointerDown = false; resetAllReaderTextLayers(); }
+function onReaderKeyUp() { if (!readerSelPointerDown) resetAllReaderTextLayers(); }
+
 function onReaderSelectionChange() {
   const rs = readerState;
   if (!rs) return;
-  // 即时管理 .selecting 类（不等防抖）：选区与某 textLayer 相交时给它加 selecting，
-  // 让 endOfContent 覆盖该 textLayer 作 user-select:none 屏障（防选区跨到顶栏 UI）
   const sel = window.getSelection();
-  const intersects = !!(sel && !sel.isCollapsed && sel.rangeCount > 0);
-  const range = intersects ? sel.getRangeAt(0) : null;
-  for (const k in rs.textLayers) {
-    const tl = rs.textLayers[k].container;
-    if (range && range.intersectsNode(tl)) tl.classList.add('selecting');
-    else tl.classList.remove('selecting');
+  if (!sel || sel.rangeCount === 0) { resetAllReaderTextLayers(); return; }
+  // 官方 activeTextLayers：选区相交的 textLayer 加 .selecting，其余 reset
+  const active = new Set();
+  for (let i = 0; i < sel.rangeCount; i++) {
+    const r = sel.getRangeAt(i);
+    for (const k in rs.textLayers) {
+      const c = rs.textLayers[k].container;
+      if (!active.has(c) && r.intersectsNode(c)) active.add(c);
+    }
   }
+  for (const k in rs.textLayers) {
+    const tl = rs.textLayers[k];
+    if (active.has(tl.container)) tl.container.classList.add('selecting');
+    else resetReaderTextLayer(tl);
+  }
+  // 官方 Safari 分支：iOS Safari 既非 Firefox 也非 Chromium148+，必走此分支（桌面 Safari 同）。
+  // 注释同官方 text_layer_builder.js：Safari 上指针悬到空白处（落到 .endOfContent）时，选区会扩展到
+  // 当前选区与 .endOfContent 之间的全部文本；把 .endOfContent 挪到选区 anchor 旁 + 设 userSelect:'text'，
+  // 把跳跃限制在当前 span 内。这是"长按直接选整页/选进顶栏笔记"的根因修复（fable 对抗审查 4/5 收敛）。
+  // 省略官方 isFirefoxOrModernChromium 判定：所有浏览器都执行此分支，桌面 Firefox/Chromium148+ 多执行
+  // 无害挪位（沙箱 27/27 验证不破坏桌面选词），iOS/桌面 Safari 必需。
+  try {
+    const range = sel.getRangeAt(0);
+    const modifyStart = selPrevRange &&
+      (range.compareBoundaryPoints(Range.END_TO_END, selPrevRange) === 0 ||
+       range.compareBoundaryPoints(Range.START_TO_END, selPrevRange) === 0);
+    let anchor = modifyStart ? range.startContainer : range.endContainer;
+    if (anchor && anchor.nodeType === Node.TEXT_NODE) anchor = anchor.parentNode;
+    if (anchor && anchor.classList && anchor.classList.contains('hl')) anchor = anchor.parentNode;
+    if (!modifyStart && range.endOffset === 0) {
+      do {
+        while (!anchor.previousSibling) anchor = anchor.parentNode;
+        anchor = anchor.previousSibling;
+      } while (!anchor.childNodes.length);
+    }
+    if (anchor && anchor.parentElement) {
+      const parentTextLayer = anchor.parentElement.closest('.textLayer');
+      if (parentTextLayer) {
+        const pageNum = Number(parentTextLayer.dataset.pageNum);
+        const tlInfo = rs.textLayers[pageNum];
+        if (tlInfo && tlInfo.endOfContent) {
+          const eoc = tlInfo.endOfContent;
+          eoc.style.width = parentTextLayer.style.width;
+          eoc.style.height = parentTextLayer.style.height;
+          eoc.style.userSelect = 'text';
+          anchor.parentElement.insertBefore(eoc, modifyStart ? anchor : anchor.nextSibling);
+        }
+      }
+    }
+    selPrevRange = range.cloneRange();
+  } catch (e) { /* 极端选区形态，忽略，不影响菜单 */ }
   clearTimeout(selChangeTimer);
   // 防抖 300ms：拖拽选区把手时 selectionchange 持续触发，松手后选区稳定才弹菜单
   selChangeTimer = setTimeout(() => {
@@ -2290,7 +2375,10 @@ function showHlMenu(x, y, mode, anno, pageNum) {
   let left = x - mw / 2;
   left = Math.max(8, Math.min(left, window.innerWidth - mw - 8));
   menu.style.left = left + 'px';
-  menu.style.top = (y + 8) + 'px';
+  const mh = menu.offsetHeight || 40;
+  let top = y + 8;
+  top = Math.max(8, Math.min(top, window.innerHeight - mh - 8)); // M7: y 夹取，选区在屏下半部时不弹到屏外
+  menu.style.top = top + 'px';
 }
 
 function hideHlMenu() {
