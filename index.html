@@ -260,7 +260,11 @@
     -webkit-tap-highlight-color: transparent;
   }
   .reader-translate-btn[aria-pressed="true"] { background: var(--accent); color: #fff; }
-  .reader-tr-status { color: var(--muted); font-size: 12px; margin-left: 4px; }
+  .reader-tr-status {
+    color: var(--muted); font-size: 12px; min-width: 0; flex-shrink: 1;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .reader-tr-status:empty { display: none; } /* tr 关时无文本不占 gap */
   /* 高亮菜单（M4） */
   .hl-menu {
     position: fixed; z-index: 50; display: flex; align-items: center; gap: 6px;
