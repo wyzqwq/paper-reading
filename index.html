@@ -183,8 +183,8 @@
      否则 span 用默认字号、无 transform -> 溢出容器被 overflow:hidden 裁掉 -> 高亮 mark 不可见。
      规则取自 pdfjs-dist@6.2.108 web/pdf_viewer.css 的 .textLayer 块。 */
   .textLayer {
-    position: absolute; left: 0; top: 0; overflow: clip; line-height: 1;
-    z-index: 2; opacity: 1; text-align: initial;
+    position: absolute; inset: 0; overflow: clip; line-height: 1;
+    z-index: 0; opacity: 1; text-align: initial;
     -webkit-text-size-adjust: none; text-size-adjust: none; forced-color-adjust: none;
     /* M7: caret-color/letter-spacing/word-spacing/color-scheme/transform-origin 对齐官方
        text_layer_builder.css，caret-color:CanvasText 告知 iOS 这是文本选区上下文 */
@@ -200,17 +200,17 @@
     /* M7: color:transparent 与官方 text_layer_builder.css 一致。iOS Safari 的 WKTextInteraction
        长按命中测试对"已布局文字字形"做检测，与 color 无关（官方 pdf.js 就用 transparent 且 iOS 能选）。
        真正让 iOS 命中 textLayer 的是容器 tabIndex=0（见 layoutPages）+ overflow:clip + caret-color。
-       -webkit-touch-callout:none 抑制 iOS 系统拷贝/翻译菜单，只走本应用的 selectionchange 高亮菜单。 */
+       -webkit-touch-callout 不设（default，与官方一致）--设 none 会让 iOS 长按不触发正常选词放大镜，
+       而是触发 select-all（选整页），这是第四轮修复的关键发现。系统菜单仍弹，selectionchange 触发高亮菜单。 */
     color: transparent;
     position: absolute; white-space: pre; cursor: text;
     transform-origin: 0% 0%;
     -webkit-user-select: text; user-select: text;
-    -webkit-touch-callout: none;
   }
   /* 叶子 span 的字号 / 缩放：pdf.js 在每个 span 上设 --font-height / --scale-x，靠这两条转成渲染 */
   .textLayer > :not(.markedContent),
   .textLayer .markedContent span:not(.markedContent) {
-    z-index: 1; /* pdf.js 官方：leaf span z-index:1，明确在 endOfContent(z-index:-1) 之上 */
+    z-index: 1; /* pdf.js 官方：leaf span z-index:1，在 endOfContent(z-index:0) 之上 */
     --font-height: 0;
     font-size: calc(var(--text-scale-factor) * var(--font-height));
     --scale-x: 1;
