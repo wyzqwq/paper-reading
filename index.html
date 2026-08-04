@@ -193,13 +193,20 @@
     --min-font-size-inv: calc(1 / var(--min-font-size));
   }
   .textLayer span, .textLayer br {
-    color: transparent; position: absolute; white-space: pre; cursor: text;
+    /* M7: iOS Safari 的长按命中测试依赖"可视文本"，color:transparent 会让系统认为 span 无可选文字
+       -> 回退去选最近的可见文字（顶栏"笔记"按钮等）。用 rgba alpha 0.01 替代 transparent：
+       非 transparent 关键字，iOS 识别为有文字可选中；alpha 0.01 肉眼不可见（canvas 文字在下可见）。
+       不能用 opacity:0.001（会让 span 内 mark.hl 高亮也不可见）。 */
+    color: rgba(0, 0, 0, 0.01);
+    position: absolute; white-space: pre; cursor: text;
     transform-origin: 0% 0%;
     -webkit-user-select: text; user-select: text;
+    -webkit-touch-callout: default; /* 确保 iOS 长按放大镜/菜单启用（防父级设 none） */
   }
   /* 叶子 span 的字号 / 缩放：pdf.js 在每个 span 上设 --font-height / --scale-x，靠这两条转成渲染 */
   .textLayer > :not(.markedContent),
   .textLayer .markedContent span:not(.markedContent) {
+    z-index: 1; /* pdf.js 官方：leaf span z-index:1，明确在 endOfContent(z-index:-1) 之上 */
     --font-height: 0;
     font-size: calc(var(--text-scale-factor) * var(--font-height));
     --scale-x: 1;
