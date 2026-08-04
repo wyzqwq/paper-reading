@@ -434,6 +434,8 @@
       <button id="reader-zoom-out" aria-label="缩小">−</button>
       <button id="reader-zoom-in" aria-label="放大">＋</button>
     </div>
+    <button class="reader-translate-btn" id="reader-translate-btn" aria-label="翻译" aria-pressed="false">翻译</button>
+    <span class="reader-tr-status" id="reader-tr-status"></span>
     <button class="reader-notes-btn" id="reader-notes-btn" aria-label="笔记">笔记</button>
   </div>
   <div class="reader-scroll" id="reader-scroll"></div>
@@ -2078,7 +2080,8 @@ async function openReader(paper, jumpPage) {
     textLayers: {},      // pageNum -> {layer, container, textDivs}（M4）
     textContentCache: {},// pageNum -> getTextContent 结果（M4，避免缩放重取）
     annos: [],           // 该论文全部高亮批注（M4）
-    hlDraft: null        // 当前菜单草稿（new/edit）
+    hlDraft: null,       // 当前菜单草稿（new/edit）
+    tr: null             // v2 翻译状态 {enabled, pages:{num:{pairs,ready,status}}, done, total, cancelled, keyMissing}
   };
 
   try {
@@ -2389,6 +2392,8 @@ function closeReader() {
     for (const k in rs.textLayers) {
       try { rs.textLayers[k].layer.cancel(); } catch (e) { /* ignore */ }
     }
+    trCancel(); // v2：取消未完成预译
+    trHideAll(); // v2：清叠层 + ZH 浮层 DOM
     if (rs.loadingTask) { try { rs.loadingTask.destroy(); } catch (e) { /* ignore */ } }
     if (rs.scrollEl) {
       rs.scrollEl.removeEventListener('scroll', onReaderScroll);
@@ -2420,6 +2425,177 @@ function saveReaderProgressNow() {
   p.updated_at = nowISO();
   dbPut(p).catch(() => {});
 }
+
+// toast（v2 翻译反馈用；复用主题变量，Task7 精修样式）
+let toastTimer = null;
+function toast(msg, ms) {
+  let el = document.getElementById('toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'toast';
+    el.style.cssText = 'position:fixed;left:50%;bottom:84px;transform:translateX(-50%);background:var(--surface-2);color:var(--text);border:1px solid var(--border);padding:10px 16px;border-radius:10px;font-size:14px;z-index:10000;max-width:80vw;box-shadow:0 6px 20px rgba(0,0,0,0.45);display:none';
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.style.display = 'block';
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.style.display = 'none'; }, ms || 3000);
+}
+
+// ===== v2 翻译：阅读器正文翻译（开关 + streamTextContent 聚合 + 整篇预译 + source_hash 缓存）=====
+// 依计划书 §11.5/§11.7。开关 opt-in；开则后台逐页顺序预译（避速率风险），page1 先译好可立刻点；
+// 每页 source_hash（该页 textLayer 文本 SHA-256）命中缓存则零调用；关开关/关阅读器取消 pending。
+// 展示（点句叠层）由 Task6 实现，本节通过 trApplyPage/trHideAll/trApplyError 钩子调用。
+
+// 取某页 textLayer 全文（复用 textContentCache；无则 streamTextContent 聚合，iOS 兼容见 aggregateTextContentStream）
+async function trExtractPageText(pageNum) {
+  const rs = readerState;
+  if (!rs || !rs.pdf) return '';
+  let tc = rs.textContentCache[pageNum];
+  if (!tc) {
+    const page = await rs.pdf.getPage(pageNum);
+    const stream = page.streamTextContent({ includeMarkedContent: true, disableNormalization: false });
+    tc = await aggregateTextContentStream(stream);
+    rs.textContentCache[pageNum] = tc;
+  }
+  // items 拼成页全文：str 按序拼接，hasEOL 处换行（贴近 textLayer 可见文本流，供 LLM 切句 + Task6 偏移匹配）
+  let s = '';
+  for (const it of tc.items || []) {
+    if (typeof it.str !== 'string') continue; // 跳过 markedContent 标记（无文本）
+    s += it.str;
+    s += it.hasEOL ? '\n' : '';
+  }
+  return s;
+}
+
+// SHA-256 hex（crypto.subtle，需 secure context；GitHub Pages HTTPS / localhost 均可）
+async function sha256Hex(text) {
+  const buf = new TextEncoder().encode(text);
+  const hash = await crypto.subtle.digest('SHA-256', buf);
+  return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// 调 translate-proxy Edge Function（带 JWT；sbFetch 自动 401 刷新）
+async function trCallProxy(text) {
+  const s = sbSession();
+  if (!s) throw new Error('未登录');
+  const headers = sbHeaders(s.access_token);
+  headers['Content-Type'] = 'application/json';
+  const res = await sbFetch(SUPABASE_URL + '/functions/v1/translate-proxy', {
+    method: 'POST', headers, body: JSON.stringify({ text })
+  });
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* ignore */ }
+  if (!res.ok) throw new Error((data && data.error) || ('翻译失败 (' + res.status + ')'));
+  if (!data || !Array.isArray(data.sentences)) throw new Error('翻译返回格式异常');
+  return data.sentences; // [{en,zh}]
+}
+
+// 翻译状态文本（顶栏 "翻译中 n/m" / "译文就绪 N 页"）
+function trRenderStatus() {
+  const rs = readerState;
+  const btn = document.getElementById('reader-translate-btn');
+  const st = document.getElementById('reader-tr-status');
+  if (!btn || !st) return;
+  if (!rs || !rs.tr || !rs.tr.enabled) {
+    btn.setAttribute('aria-pressed', 'false');
+    st.textContent = (rs && rs.tr && rs.tr.keyMissing) ? '需先设置 DeepSeek key' : '';
+    return;
+  }
+  btn.setAttribute('aria-pressed', 'true');
+  const tr = rs.tr;
+  st.textContent = (tr.done >= tr.total && tr.total > 0) ? ('译文就绪 ' + tr.total + ' 页') : ('翻译中 ' + tr.done + '/' + tr.total);
+}
+
+// 确保某页有 pairs：缓存命中（source_hash 一致）直接用；否则提取文本->调代理->存缓存
+async function trEnsurePairs(pageNum) {
+  const rs = readerState;
+  if (!rs || !rs.tr || rs.tr.cancelled) return null;
+  const tr = rs.tr;
+  const paperId = rs.paper.id;
+  const userId = sbSession() && sbSession().user && sbSession().user.id;
+  const cached = await dbGetTranslation(paperId, pageNum).catch(() => null);
+  const text = await trExtractPageText(pageNum);
+  const hash = await sha256Hex(text);
+  if (cached && cached.source_hash === hash && Array.isArray(cached.pairs)) {
+    // 命中缓存（含空页空 pairs 占位）零调用；pairs 可能空（空页）但 hash 一致即视为有效
+    tr.pages[pageNum] = { pairs: cached.pairs, ready: true, status: 'ready' };
+    return { pairs: cached.pairs, fromCache: true };
+  }
+  // 空页（纯图/封面）：无文本可译，存空 pairs 占位避免反复调代理
+  if (!text.trim()) {
+    const pairs = [];
+    await dbPutTranslation({ id: (cached && cached.id) || uid(), user_id: userId, paper_id: paperId, page_num: pageNum, pairs, source_hash: hash });
+    tr.pages[pageNum] = { pairs, ready: true, status: 'ready' };
+    return { pairs, fromCache: false };
+  }
+  tr.pages[pageNum] = Object.assign(tr.pages[pageNum] || {}, { status: 'translating' });
+  trRenderStatus();
+  const pairs = await trCallProxy(text);
+  if (!rs.tr || rs.tr.cancelled) return null; // 调用期间被取消
+  await dbPutTranslation({ id: (cached && cached.id) || uid(), user_id: userId, paper_id: paperId, page_num: pageNum, pairs, source_hash: hash });
+  tr.pages[pageNum] = { pairs, ready: true, status: 'ready' };
+  return { pairs, fromCache: false };
+}
+
+// 整篇顺序预译：page1 先译好可立刻点，后续排队；顺序执行避 DeepSeek 速率风险
+async function trPretranslateLoop() {
+  const rs = readerState;
+  if (!rs || !rs.tr) return;
+  const tr = rs.tr;
+  tr.total = rs.numPages;
+  tr.done = 0;
+  trRenderStatus();
+  for (let i = 1; i <= rs.numPages; i++) {
+    if (tr.cancelled || !tr.enabled) break;
+    try {
+      const r = await trEnsurePairs(i);
+      if (r) { tr.done = i; trRenderStatus(); trApplyPage(i); } // Task6 渲染该页叠层
+    } catch (e) {
+      const msg = e && e.message ? e.message : String(e);
+      tr.pages[i] = { pairs: [], ready: false, status: 'error', error: msg };
+      tr.done = i;
+      trRenderStatus();
+      // key 无效/未设置/未登录：后续都会失败，停整篇预译
+      if (/未设置|key 无效|未登录/.test(msg)) { tr.keyMissing = /未设置|未登录/.test(msg); trApplyError(msg); break; }
+      trApplyError('第 ' + i + ' 页翻译失败：' + msg);
+    }
+  }
+  if (!tr.cancelled && tr.enabled) trRenderStatus();
+}
+
+// 开关（opt-in；读英文论文不花钱）
+async function toggleTranslate(forceState) {
+  const rs = readerState;
+  if (!rs || !rs.ready) return;
+  const turnOn = forceState != null ? forceState : !(rs.tr && rs.tr.enabled);
+  if (turnOn) {
+    if (!navigator.onLine) { toast('翻译需联网'); return; }
+    if (!sbSession()) { toast('翻译需登录'); return; }
+    rs.tr = rs.tr || { enabled: false, pages: {}, done: 0, total: rs.numPages, cancelled: false };
+    rs.tr.enabled = true;
+    rs.tr.cancelled = false;
+    rs.tr.keyMissing = false;
+    rs.tr.pages = rs.tr.pages || {};
+    trRenderStatus();
+    await trPretranslateLoop();
+  } else {
+    if (rs.tr) { rs.tr.enabled = false; rs.tr.cancelled = true; }
+    trHideAll(); // Task6 隐藏叠层 + ZH 浮层
+    trRenderStatus();
+  }
+}
+
+// 关阅读器/关开关时取消 pending 预译
+function trCancel() {
+  const rs = readerState;
+  if (rs && rs.tr) { rs.tr.cancelled = true; rs.tr.enabled = false; }
+}
+
+// Task6 钩子（叠层渲染）：Task5 预译完一页调 trApplyPage；Task6 实现真正的偏移->span 映射 + 点句叠层
+function trApplyPage(pageNum) { /* Task6 */ }
+function trHideAll() { /* Task6：隐藏所有译文叠层 + ZH 浮层 */ }
+function trApplyError(msg) { toast(msg, 4000); }
 
 // ===== 高亮批注（M4）=====
 // 高亮双色：黄 + 蓝。选中色 ::selection 用 accent 古铜金 rgba(201,169,110)，
@@ -2734,6 +2910,7 @@ document.getElementById('reader-close').addEventListener('click', closeReader);
 document.getElementById('reader-zoom-in').addEventListener('click', () => readerZoom(1.2));
 document.getElementById('reader-zoom-out').addEventListener('click', () => readerZoom(1 / 1.2));
 document.getElementById('reader-notes-btn').addEventListener('click', toggleReaderNotes);
+document.getElementById('reader-translate-btn').addEventListener('click', () => toggleTranslate());
 document.getElementById('reader-notes-close').addEventListener('click', () => {
   document.getElementById('reader-notes').style.display = 'none';
 });
