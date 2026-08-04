@@ -1959,6 +1959,27 @@ async function renderPage(canvas) {
   }
 }
 
+// 聚合 streamTextContent 返回的 ReadableStream（M7）：iOS Safari 18.7 的 JavaScriptCore 不支持
+// ReadableStream 的 async iteration（`for await...of` on ReadableStream 抛 TypeError "undefined is not a function"），
+// 而 pdf.js getTextContent 内部正是 `for await(const t of streamTextContent(...))` 聚合 -> iOS 直接抛错、spanCount=0。
+// 改用 getReader/read 手动聚合，不依赖 Symbol.asyncIterator。聚合后的 {items,styles,lang} 传给 TextLayer
+// constructor 走 typeof==="object" 分支包装成新 ReadableStream，render() 用 getReader 读，全程绕开 async iteration。
+async function aggregateTextContentStream(stream) {
+  const reader = stream.getReader();
+  const items = [];
+  const styles = Object.create(null);
+  let lang = null;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    if (lang == null && value.lang != null) lang = value.lang;
+    if (value.styles) Object.assign(styles, value.styles);
+    if (value.items) for (const it of value.items) items.push(it);
+  }
+  return { items, styles, lang };
+}
+
 // 渲染某页 textLayer（M4）：pdf.js v6 TextLayer，透明文字层供选中/高亮
 async function renderTextLayer(canvas, cssScale) {
   const rs = readerState;
@@ -1979,8 +2000,11 @@ async function renderTextLayer(canvas, cssScale) {
     trace.steps.push('factor');
     let tc = rs.textContentCache[pageNum];
     if (!tc) {
-      // M7: includeMarkedContent 对齐官方 TextLayerBuilder（streamTextContent 默认带），结构/无障碍语义一致
-      tc = await page.getTextContent({ includeMarkedContent: true });
+      // M7: iOS Safari 不支持 ReadableStream 的 async iteration（for await...of 抛 TypeError "undefined is not a function"），
+      // pdf.js getTextContent 内部用 `for await(const t of streamTextContent(...))` 聚合，iOS 直接抛错 -> spanCount=0。
+      // 改用 streamTextContent 拿 ReadableStream + aggregateTextContentStream（getReader/read 手动聚合，不依赖 Symbol.asyncIterator）。
+      const stream = page.streamTextContent({ includeMarkedContent: true, disableNormalization: false });
+      tc = await aggregateTextContentStream(stream);
       rs.textContentCache[pageNum] = tc;
       trace.steps.push('getTextContent');
     } else {
