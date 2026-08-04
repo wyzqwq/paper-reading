@@ -387,6 +387,19 @@
         <button class="btn-secondary" id="acct-logout" style="margin-top:8px;padding:8px 14px;font-size:13px">登出</button>
       </div>
     </div>
+    <div id="translate-section" style="border-bottom:1px solid var(--border);padding-bottom:12px;margin-bottom:12px">
+      <label>翻译（DeepSeek）</label>
+      <div id="translate-loggedout" class="hint" style="padding:4px 0">登录后可填 DeepSeek API key，启用阅读器正文翻译。</div>
+      <div id="translate-loggedin" style="display:none">
+        <input id="deepseek-key" type="password" placeholder="sk-...（DeepSeek API key）" autocomplete="off" style="margin-top:6px">
+        <div class="hint" style="margin-top:4px">key 存 Supabase（user_secrets 表，仅自己可读），经 Edge Function 代理转发 DeepSeek；不进前端持久状态、不进 git，跨设备同步。</div>
+        <div class="btns" style="margin-top:8px">
+          <button class="btn-primary" id="deepseek-save">保存</button>
+          <button class="btn-secondary" id="deepseek-show" style="font-size:13px;padding:8px 14px">显示</button>
+        </div>
+        <div class="hint" id="deepseek-msg"></div>
+      </div>
+    </div>
     <label>订阅管理（日推来源）</label>
     <div id="sub-list"></div>
     <button type="button" class="btn-secondary" id="sub-add" style="margin-top:8px;padding:8px 14px;font-size:13px">+ 新增订阅</button>
@@ -1330,6 +1343,7 @@ function renderAcct() {
     out.style.display = 'block';
     inn.style.display = 'none';
   }
+  renderTranslateSection(); // v2：翻译设置区随账号状态刷新
 }
 function setAcctMsg(text, isErr) {
   const el = document.getElementById('acct-msg');
@@ -1365,6 +1379,55 @@ document.getElementById('acct-signup').addEventListener('click', async () => {
 });
 document.getElementById('acct-logout').addEventListener('click', async () => {
   await sbLogout(); renderAcct(); setAcctMsg('');
+});
+
+// ===== 翻译设置（v2 §11.3）：DeepSeek key 填写 + user_secrets 同步 =====
+function setDeepseekMsg(text, isErr) {
+  const el = document.getElementById('deepseek-msg');
+  if (el) { el.textContent = text || ''; el.style.color = isErr ? 'var(--danger)' : 'var(--muted)'; }
+}
+
+// 渲染翻译设置区：登录才显示 key 输入；从 IDB 读已存 key（syncPull 已填充）
+async function renderTranslateSection() {
+  const s = sbSession();
+  const out = document.getElementById('translate-loggedout');
+  const inn = document.getElementById('translate-loggedin');
+  const input = document.getElementById('deepseek-key');
+  if (!out || !inn || !input) return;
+  if (s && s.user) {
+    out.style.display = 'none';
+    inn.style.display = 'block';
+    const row = await dbGetSecret(s.user.id).catch(() => null);
+    input.value = (row && row.deepseek_key) || '';
+    input.type = 'password'; // 每次重置为掩码
+    const showBtn = document.getElementById('deepseek-show');
+    if (showBtn) showBtn.textContent = '显示';
+    setDeepseekMsg(row && row.deepseek_key ? '已设置 key（加密保存，跨设备同步）' : '', false);
+  } else {
+    out.style.display = 'block';
+    inn.style.display = 'none';
+    input.value = '';
+    setDeepseekMsg('', false);
+  }
+}
+
+document.getElementById('deepseek-save').addEventListener('click', async () => {
+  const s = sbSession();
+  if (!s || !s.user) { setDeepseekMsg('请先登录', true); return; }
+  const key = document.getElementById('deepseek-key').value.trim();
+  if (!key) { setDeepseekMsg('key 不能为空', true); return; }
+  setDeepseekMsg('保存中…');
+  try {
+    await dbPutSecret({ user_id: s.user.id, deepseek_key: key }); // schedulePush 推到 Supabase user_secrets
+    setDeepseekMsg('已保存', false);
+  } catch (e) { setDeepseekMsg('保存失败：' + e.message, true); }
+});
+
+document.getElementById('deepseek-show').addEventListener('click', () => {
+  const input = document.getElementById('deepseek-key');
+  const btn = document.getElementById('deepseek-show');
+  if (input.type === 'password') { input.type = 'text'; btn.textContent = '隐藏'; }
+  else { input.type = 'password'; btn.textContent = '显示'; }
 });
 
 // ===== 同步引擎（M6 §3.7：pull/push 四表 LWW + tombstone 软删除 + 防抖推送）=====
@@ -1465,6 +1528,7 @@ async function syncPull() {
     }
   } catch (e) { console.warn('pull user_secrets err:', e.message); }
   render();
+  renderTranslateSection(); // v2：拉到 key 后刷新设置页（若打开）
 }
 
 // 本地变更后防抖推送：只推 _dirty=true 的行（dbPut/dbDelete 置 true），upsert 成功后置 false；_dirty 不进 Supabase
