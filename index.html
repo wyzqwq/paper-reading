@@ -170,6 +170,8 @@
     flex: 1; overflow-y: auto; overflow-x: auto; padding: 12px 0;
     display: flex; flex-direction: column; align-items: flex-start; gap: 12px;
     -webkit-overflow-scrolling: touch;
+    touch-action: pan-x pan-y; /* M7：允许双向滚动 + 禁止浏览器原生 pinch-zoom，但不禁止长按选词；
+      配合 touch 监听改 passive:true，避免 passive:false 干扰 iOS 长按手势识别（选词放大镜不弹） */
   }
   .reader-page { display: flex; justify-content: center; position: relative; margin: 0 auto; }
   .reader-page canvas {
@@ -1851,8 +1853,8 @@ async function openReader(paper, jumpPage) {
     // 改听 document selectionchange + 防抖 300ms，松手后选区稳定即弹高亮菜单，鼠标/触摸通用
     document.addEventListener('selectionchange', onReaderSelectionChange);
     scrollEl.addEventListener('click', onReaderClick);
-    scrollEl.addEventListener('touchstart', onReaderTouchStart, { passive: false });
-    scrollEl.addEventListener('touchmove', onReaderTouchMove, { passive: false });
+    scrollEl.addEventListener('touchstart', onReaderTouchStart, { passive: true });
+    scrollEl.addEventListener('touchmove', onReaderTouchMove, { passive: true });
     scrollEl.addEventListener('touchend', onReaderTouchEnd);
   } catch (e) {
     scrollEl.innerHTML = '<div class="reader-error">PDF 加载失败：' +
@@ -1996,7 +1998,8 @@ function onReaderTouchStart(e) {
   const rs = readerState;
   if (!rs || !rs.ready) return;
   if (e.touches.length === 2) {
-    e.preventDefault(); // 阻止 iOS 浏览器双指页面缩放
+    // M7：不 preventDefault（passive:true），靠 .reader-scroll 的 touch-action:pan-x pan-y
+    // 阻止浏览器原生 pinch-zoom；passive:true 避免干扰 iOS 长按选词手势识别（放大镜不弹的元凶）
     rs._pinching = true;
     rs._pinchInitialDist = pinchDist(e.touches);
     rs._pinchInitialZoom = rs.zoom;
@@ -2005,7 +2008,7 @@ function onReaderTouchStart(e) {
 function onReaderTouchMove(e) {
   const rs = readerState;
   if (!rs || !rs._pinching || e.touches.length !== 2) return;
-  e.preventDefault(); // 双指时阻止默认（页面缩放/滚动），单指滚动不受影响（上面 return）
+  // M7：不 preventDefault（passive:true），靠 touch-action:pan-x pan-y 阻止浏览器 pinch-zoom
   if (rs._pinchInitialDist > 0) {
     pinchTarget = rs._pinchInitialZoom * (pinchDist(e.touches) / rs._pinchInitialDist);
     if (!pinchRaf) pinchRaf = requestAnimationFrame(() => { pinchRaf = null; readerZoom(undefined, pinchTarget); });
