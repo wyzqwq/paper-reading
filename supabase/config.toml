@@ -4,3 +4,8 @@
 [functions.arxiv-proxy]
 # arXiv API 公开，代理无需鉴权；前端不带 JWT 也能调。
 verify_jwt = false
+
+[functions.translate-proxy]
+# v2 翻译代理：读调用者 user_secrets 里的 DeepSeek key 转发 DeepSeek。
+# 必须验 JWT：既防盗用 DeepSeek 调用（计费），又用调用者身份查自己的 key（RLS）。
+verify_jwt = true
