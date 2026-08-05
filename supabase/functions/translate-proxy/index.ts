@@ -40,6 +40,7 @@ const SYSTEM_PROMPT = [
   '4. 数学公式、变量符号(如 x²、α、∇)、代码、URL、参考文献编号 原样保留不译,只译周围文字。',
   '5. 已是中文的片段跳过不译,en 照抄、zh 留原样或空。',
   '6. 句子间顺序与原文一致;不要增删句子;不要加任何解释/前言/后语,只输出 JSON。',
+  '7. 用户消息可能含 <page>本页文本</page> + <ctx_prev>上一页末尾</ctx_prev> / <ctx_next>下一页开头</ctx_next> 上下文。只翻译 <page> 内的文本(它才是当前页),<ctx_*> 仅供理解跨页句语义,不译、不出现在 sentences 里。本页首尾可能是不完整句(跨页切断),照常译,译文可与上下文衔接。',
 ].join('\n');
 
 function json(status: number, body: unknown) {

@@ -2482,7 +2482,52 @@ function toast(msg, ms) {
 
 // 缓存版本：拼进 source_hash（sha256(TR_CACHE_VERSION + text)）。空串=初始版，与既有缓存 sha256(text) 兼容；
 // 改 Edge Function 的 SYSTEM_PROMPT / DEEPSEEK_MODEL 时同步 bump（'v2'/'v3'...），旧缓存 hash 不符自动失效重译。
-const TR_CACHE_VERSION = '';
+const TR_CACHE_VERSION = 'ctx1'; // bump: 加跨页上下文 <ctx_*> + 分块翻译，旧缓存 hash 不符自动失效重译
+
+// 分块上限：单次调 DeepSeek 文本 <= 此值，避长文本超时 504（Supabase Edge Function 网关超时）
+const TR_CHUNK_SIZE = 4000;
+
+// 把页文本按段落+句号切成 <= maxChunk 的块，每块独立调代理（避整页超时）；以句边界切，不切断句
+function trSplitText(text, maxChunk) {
+  if (!text) return [];
+  if (text.length <= maxChunk) return [text];
+  const chunks = [];
+  const flush = (s) => { if (s && s.trim()) chunks.push(s); };
+  const paras = text.split(/\n{2,}/); // 段落（双换行）
+  let cur = '';
+  for (const p of paras) {
+    const cand = cur ? cur + '\n\n' + p : p;
+    if (cand.length <= maxChunk) { cur = cand; continue; }
+    flush(cur); cur = '';
+    if (p.length <= maxChunk) { cur = p; continue; }
+    // 单段超长：按句号切
+    const sents = p.split(/(?<=[.!?;])\s+/);
+    let sc = '';
+    for (const s of sents) {
+      const cand2 = sc ? sc + ' ' + s : s;
+      if (cand2.length <= maxChunk) { sc = cand2; continue; }
+      flush(sc); sc = '';
+      if (s.length <= maxChunk) { sc = s; continue; }
+      // 单句超长（罕见）：硬切
+      for (let i = 0; i < s.length; i += maxChunk) flush(s.slice(i, i + maxChunk));
+    }
+    flush(sc);
+  }
+  flush(cur);
+  return chunks;
+}
+
+// 取相邻页上下文（跨页句辅助）：dir='tail' 末尾 1-2 句，'head' 开头 1-2 句。供 DeepSeek 理解跨页句语义
+async function trGetCtx(pageNum, dir) {
+  try {
+    const text = await trExtractPageText(pageNum);
+    if (!text || !text.trim()) return '';
+    const sents = text.split(/(?<=[.!?;])\s+/).filter((s) => s.trim());
+    if (!sents.length) return '';
+    const picked = dir === 'tail' ? sents.slice(-2) : sents.slice(0, 2);
+    return picked.join(' ').slice(0, 600); // 限长防 ctx 过大
+  } catch { return ''; }
+}
 
 // 取某页 textLayer 全文（复用 textContentCache；无则 streamTextContent 聚合，iOS 兼容见 aggregateTextContentStream）
 async function trExtractPageText(pageNum) {
@@ -2512,8 +2557,8 @@ async function sha256Hex(text) {
   return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-// 调 translate-proxy Edge Function（带 JWT；sbFetch 自动 401 刷新）
-async function trCallProxy(text) {
+// 单次调 translate-proxy（带 JWT；sbFetch 自动 401 刷新）。text 可含 <ctx_*> 上下文标记
+async function trCallProxySingle(text) {
   const s = sbSession();
   if (!s) throw new Error('未登录');
   const headers = sbHeaders(s.access_token);
@@ -2526,6 +2571,25 @@ async function trCallProxy(text) {
   if (!res.ok) throw new Error((data && data.error) || ('翻译失败 (' + res.status + ')'));
   if (!data || !Array.isArray(data.sentences)) throw new Error('翻译返回格式异常');
   return data.sentences; // [{en,zh}]
+}
+
+// 翻译整页文本：分块（避超时 504）+ 跨页上下文（首块带 prevCtx、末块带 nextCtx，<ctx_*> 标记供 Edge Function 识别只译 <page>）
+async function trCallProxy(text, opts) {
+  const rs = readerState;
+  const prevCtx = opts && opts.prevCtx;
+  const nextCtx = opts && opts.nextCtx;
+  const chunks = trSplitText(text, TR_CHUNK_SIZE);
+  if (chunks.length === 0) return [];
+  const all = [];
+  for (let i = 0; i < chunks.length; i++) {
+    if (rs && rs.tr && (rs.tr.cancelled || !rs.tr.enabled)) throw new Error('已取消');
+    let body = chunks[i];
+    if (i === 0 && prevCtx) body = '<ctx_prev>' + prevCtx + '</ctx_prev>\n' + body;
+    if (i === chunks.length - 1 && nextCtx) body += '\n<ctx_next>' + nextCtx + '</ctx_next>';
+    const pairs = await trCallProxySingle(body);
+    if (Array.isArray(pairs)) all.push(...pairs);
+  }
+  return all;
 }
 
 // 翻译状态文本（顶栏 "翻译中 n/m" / "译文就绪 N 页"）
@@ -2585,7 +2649,10 @@ async function trEnsurePairs(pageNum) {
   }
   tr.pages[pageNum] = Object.assign(tr.pages[pageNum] || {}, { status: 'translating' });
   trRenderStatus();
-  const pairs = await trCallProxy(text);
+  // 跨页上下文：前页末尾 + 后页开头，让 DeepSeek 理解跨页句（只译本页 <page>，ctx 不译）
+  const prevCtx = pageNum > 1 ? await trGetCtx(pageNum - 1, 'tail') : '';
+  const nextCtx = pageNum < rs.numPages ? await trGetCtx(pageNum + 1, 'head') : '';
+  const pairs = await trCallProxy(text, { prevCtx, nextCtx });
   console.log('[tr] p' + pageNum, '代理返回 pairs=' + (pairs ? pairs.length : 'null'));
   if (!rs.tr || rs.tr.cancelled) return null; // 调用期间被取消
   await dbPutTranslation({ id: (cached && cached.id) || uid(), user_id: userId, paper_id: paperId, page_num: pageNum, pairs, source_hash: hash });
@@ -2609,7 +2676,9 @@ async function trRetranslatePage(pageNum) {
   const hash = await sha256Hex(TR_CACHE_VERSION + text);
   let pairs = [];
   if (text.trim()) {
-    try { pairs = await trCallProxy(text); }
+    const prevCtx = pageNum > 1 ? await trGetCtx(pageNum - 1, 'tail') : '';
+    const nextCtx = pageNum < rs.numPages ? await trGetCtx(pageNum + 1, 'head') : '';
+    try { pairs = await trCallProxy(text, { prevCtx, nextCtx }); }
     catch (e) { trApplyError('重译失败：' + ((e && e.message) || e)); tr.pages[pageNum].status = 'error'; trRenderStatus(); return; }
     if (!rs.tr || rs.tr.cancelled) return;
   }
@@ -2634,7 +2703,7 @@ async function trPretranslateLoop() {
     if (tr.cancelled || !tr.enabled) break;
     try {
       const r = await trEnsurePairs(i);
-      if (r) { tr.done = i; trRenderStatus(); trApplyPage(i); } // Task6 渲染该页叠层
+      if (r) { tr.done++; trRenderStatus(); trApplyPage(i); } // done 计成功数（失败不计，状态栏不再假"译完"）
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
       console.log('[tr] p' + i, '失败:', msg);
