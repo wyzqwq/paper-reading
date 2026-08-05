@@ -2484,8 +2484,8 @@ function toast(msg, ms) {
 // 改 Edge Function 的 SYSTEM_PROMPT / DEEPSEEK_MODEL 时同步 bump（'v2'/'v3'...），旧缓存 hash 不符自动失效重译。
 const TR_CACHE_VERSION = 'ctx1'; // bump: 加跨页上下文 <ctx_*> + 分块翻译，旧缓存 hash 不符自动失效重译
 
-// 分块上限：单次调 DeepSeek 文本 <= 此值，避长文本超时 504（Supabase Edge Function 网关超时）
-const TR_CHUNK_SIZE = 4000;
+// 分块上限：4000 边界偶发 504/546（p8 3971 失败/p7 3953 成功，DeepSeek 响应波动），2000 更稳
+const TR_CHUNK_SIZE = 2000;
 
 // 把页文本按段落+句号切成 <= maxChunk 的块，每块独立调代理（避整页超时）；以句边界切，不切断句
 function trSplitText(text, maxChunk) {
@@ -2586,7 +2586,10 @@ async function trCallProxy(text, opts) {
     let body = chunks[i];
     if (i === 0 && prevCtx) body = '<ctx_prev>' + prevCtx + '</ctx_prev>\n' + body;
     if (i === chunks.length - 1 && nextCtx) body += '\n<ctx_next>' + nextCtx + '</ctx_next>';
-    const pairs = await trCallProxySingle(body);
+    console.log('[tr] chunk ' + (i + 1) + '/' + chunks.length, 'len=' + body.length);
+    let pairs;
+    try { pairs = await trCallProxySingle(body); }
+    catch (e) { console.log('[tr] chunk ' + (i + 1) + ' 失败:', e.message); throw e; }
     if (Array.isArray(pairs)) all.push(...pairs);
   }
   return all;
