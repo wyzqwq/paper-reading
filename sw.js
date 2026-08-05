@@ -1,6 +1,8 @@
-// M1 Service Worker：缓存 app 壳。pdf.js（M2 加入预缓存）；wasm/字体运行时缓存。
-// 更新提示（"有更新，点击刷新"）留 M7。
-const CACHE = 'paper-reading-v23';
+// M1 Service Worker：缓存 app 壳。pdf.js/wasm/字体运行时缓存。
+// P0：waiting 模式（install 不 skipWaiting，等页面 postMessage SKIP_WAITING 才接管），
+// 配合"有新版本"横幅让用户决定何时刷新，不在阅读中途强制 reload 丢阅读现场。
+// P0：导航 network-first（总拿新版，离线回缓存）；资源 cache-first + res.ok 守卫。
+const CACHE = 'paper-reading-v24';
 const SHELL = [
   './',
   './index.html',
@@ -13,9 +15,8 @@ const SHELL = [
 ];
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(
-    caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting())
-  );
+  // 不 skipWaiting：进入 waiting，等用户点"刷新"后页面 postMessage SKIP_WAITING 才接管
+  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)));
 });
 
 self.addEventListener('activate', (e) => {
@@ -24,6 +25,11 @@ self.addEventListener('activate', (e) => {
       .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
       .then(() => self.clients.claim())
   );
+});
+
+// waiting 模式：页面发 SKIP_WAITING 才 skipWaiting 接管
+self.addEventListener('message', (e) => {
+  if (e.data && e.data.type === 'SKIP_WAITING') self.skipWaiting();
 });
 
 self.addEventListener('fetch', (e) => {
@@ -55,17 +61,31 @@ self.addEventListener('fetch', (e) => {
     })());
     return;
   }
+  // 导航请求：network-first（总拿新版，避免 cache-first 永久卡旧版且无提示；
+  // 离线/网络失败回缓存或 index.html）
+  if (req.mode === 'navigate') {
+    e.respondWith((async () => {
+      try {
+        const res = await fetch(req);
+        if (res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {}); }
+        return res;
+      } catch (err) {
+        return (await caches.match(req)) || caches.match('./index.html');
+      }
+    })());
+    return;
+  }
+  // 资源请求：cache-first + res.ok 守卫（不缓存 404 等）
   e.respondWith(
     caches.match(req).then((hit) =>
       hit || fetch(req).then((res) => {
-        // 同源新资源顺带缓存（stale-while-revalidate 风格）
-        const copy = res.clone();
-        caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
+        if (res.ok) {
+          const copy = res.clone();
+          caches.open(CACHE).then((c) => c.put(req, copy)).catch(() => {});
+        }
         return res;
       }).catch(() => {
-        // 离线回退：仅导航请求（HTML 页面）回 index.html；资源请求（图标等）失败返回 404，
-        // 别返回 HTML（否则 iOS 拿到 HTML 当图标，Add to Home Screen 显示空白）
-        if (req.mode === 'navigate') return caches.match('./index.html');
+        // 离线回退：资源请求失败返回 404，别返回 HTML（否则 iOS 拿 HTML 当图标，Add to Home Screen 显示空白）
         return new Response('', { status: 404, statusText: 'Not Found' });
       })
     )

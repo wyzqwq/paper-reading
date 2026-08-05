@@ -2349,6 +2349,7 @@ function onReaderScroll() {
   if (rs.saveTimer) clearTimeout(rs.saveTimer);
   rs.saveTimer = setTimeout(() => saveReaderProgress(frac), 500);
   trHidePopup(); // v2：滚动即收起 ZH 浮层（浮层 fixed 定位不随内容滚）
+  if (rs.tr && rs.tr.enabled) trRenderStatus(); // v2：刷新当前页 matched 率
 }
 
 async function saveReaderProgress(frac) {
@@ -2476,6 +2477,10 @@ function toast(msg, ms) {
 // 每页 source_hash（该页 textLayer 文本 SHA-256）命中缓存则零调用；关开关/关阅读器取消 pending。
 // 展示（点句叠层）由 Task6 实现，本节通过 trApplyPage/trHideAll/trApplyError 钩子调用。
 
+// 缓存版本：拼进 source_hash（sha256(TR_CACHE_VERSION + text)）。空串=初始版，与既有缓存 sha256(text) 兼容；
+// 改 Edge Function 的 SYSTEM_PROMPT / DEEPSEEK_MODEL 时同步 bump（'v2'/'v3'...），旧缓存 hash 不符自动失效重译。
+const TR_CACHE_VERSION = '';
+
 // 取某页 textLayer 全文（复用 textContentCache；无则 streamTextContent 聚合，iOS 兼容见 aggregateTextContentStream）
 async function trExtractPageText(pageNum) {
   const rs = readerState;
@@ -2533,7 +2538,20 @@ function trRenderStatus() {
   }
   btn.setAttribute('aria-pressed', 'true');
   const tr = rs.tr;
-  st.textContent = (tr.done >= tr.total && tr.total > 0) ? ('译文就绪 ' + tr.total + ' 页') : ('翻译中 ' + tr.done + '/' + tr.total);
+  const done = tr.done >= tr.total && tr.total > 0;
+  let txt = done ? ('译文就绪 ' + tr.total + ' 页') : ('翻译中 ' + tr.done + '/' + tr.total);
+  // 整篇就绪时附当前页匹配率（漏句可见；可点重译）
+  if (done) {
+    const cur = currentReaderPage();
+    const pg = cur && tr.pages[cur];
+    if (pg && pg.ready && Array.isArray(pg.pairs) && pg.pairs.length) {
+      const m = (pg.matched != null) ? pg.matched : 0;
+      txt += ' · 本页 ' + m + '/' + pg.pairs.length;
+      if (m < pg.pairs.length) txt += '（点此重译）';
+    }
+  }
+  st.textContent = txt;
+  st.style.cursor = done ? 'pointer' : 'default';
 }
 
 // 确保某页有 pairs：缓存命中（source_hash 一致）直接用；否则提取文本->调代理->存缓存
@@ -2545,7 +2563,7 @@ async function trEnsurePairs(pageNum) {
   const userId = sbSession() && sbSession().user && sbSession().user.id;
   const cached = await dbGetTranslation(paperId, pageNum).catch(() => null);
   const text = await trExtractPageText(pageNum);
-  const hash = await sha256Hex(text);
+  const hash = await sha256Hex(TR_CACHE_VERSION + text);
   if (cached && cached.source_hash === hash && Array.isArray(cached.pairs)) {
     // 命中缓存（含空页空 pairs 占位）零调用；pairs 可能空（空页）但 hash 一致即视为有效
     tr.pages[pageNum] = { pairs: cached.pairs, ready: true, status: 'ready' };
@@ -2565,6 +2583,32 @@ async function trEnsurePairs(pageNum) {
   await dbPutTranslation({ id: (cached && cached.id) || uid(), user_id: userId, paper_id: paperId, page_num: pageNum, pairs, source_hash: hash });
   tr.pages[pageNum] = { pairs, ready: true, status: 'ready' };
   return { pairs, fromCache: false };
+}
+
+// 重译本页（用户点状态栏触发）：绕过缓存命中检查，强制重调代理拿新 pairs 覆盖
+async function trRetranslatePage(pageNum) {
+  const rs = readerState;
+  if (!rs || !rs.tr || rs.tr.cancelled) return;
+  const tr = rs.tr;
+  const paperId = rs.paper.id;
+  const userId = sbSession() && sbSession().user && sbSession().user.id;
+  const tl = rs.textLayers && rs.textLayers[pageNum];
+  if (tl) trUnwrapPage(tl.container);
+  tr.pages[pageNum] = Object.assign(tr.pages[pageNum] || {}, { ready: false, status: 'translating', matched: 0 });
+  trRenderStatus();
+  const text = await trExtractPageText(pageNum);
+  const hash = await sha256Hex(TR_CACHE_VERSION + text);
+  let pairs = [];
+  if (text.trim()) {
+    try { pairs = await trCallProxy(text); }
+    catch (e) { trApplyError('重译失败：' + ((e && e.message) || e)); tr.pages[pageNum].status = 'error'; trRenderStatus(); return; }
+    if (!rs.tr || rs.tr.cancelled) return;
+  }
+  const cached = await dbGetTranslation(paperId, pageNum).catch(() => null);
+  await dbPutTranslation({ id: (cached && cached.id) || uid(), user_id: userId, paper_id: paperId, page_num: pageNum, pairs, source_hash: hash });
+  tr.pages[pageNum] = { pairs, ready: true, status: 'ready' };
+  trApplyPage(pageNum);
+  trRenderStatus();
 }
 
 // 整篇顺序预译：page1 先译好可立刻点，后续排队；顺序执行避 DeepSeek 速率风险
@@ -2660,7 +2704,35 @@ function trBuildTextMap(pageNum) {
     noWs += raw[j];
     noWsToRaw.push(j);
   }
-  return { raw, norm, rawStart, noWs, noWsToRaw };
+  // level5 用：折叠字符级差异（弯直引号/dash 归一 + 去断词连字符 + 去空白）+ 每个 fold 字符对应的 raw 偏移
+  // 救 DeepSeek 字符级 verbatim 漂移：断词 knowl-\nedge->knowledge、弯引号 ‘->' 、dash –->- （5 agent 实测 15-20% 漏句主因）
+  const FOLD = { '‘':"'", '’':"'", '‚':"'", '‛':"'", '“':'"', '”':'"', '„':'"', '‟':'"', '–':'-', '—':'-', '−':'-' };
+  let fold = '';
+  const foldToRaw = [];
+  for (let j = 0; j < raw.length; j++) {
+    if (isWs(raw[j])) continue;
+    const ch = FOLD[raw[j]] || raw[j];
+    // 词中连字符（归一后是 -，fold 串前一字符 + raw 下一非空白字符均为字母）：去掉
+    // 救断词 knowl-edge->knowledge 与正常 well-known->wellknown 统一处理（DeepSeek 常还原无连字符）
+    if (ch === '-' && fold.length > 0 && /[a-zA-Z]/.test(fold[fold.length - 1])) {
+      let n = j + 1; while (n < raw.length && isWs(raw[n])) n++;
+      if (n < raw.length && /[a-zA-Z]/.test(raw[n])) continue;
+    }
+    fold += ch;
+    foldToRaw.push(j);
+  }
+  return { raw, norm, rawStart, noWs, noWsToRaw, fold, foldToRaw };
+}
+
+// level5 折叠：与 map.fold 构造一致（弯引号/dash 归一 + 去空白 + 词中连字符去除）
+function trFoldStr(s) {
+  if (!s) return '';
+  return s
+    .replace(/[‘’‚‛]/g, "'")
+    .replace(/[“”„‟]/g, '"')
+    .replace(/[–-−]/g, '-')
+    .replace(/\s+/g, '')
+    .replace(/([a-zA-Z])-(?=[a-zA-Z])/g, '$1');
 }
 
 // 在 map.raw 里从 fromPos 起找 en 句的 [start,end)。三级匹配：原样 -> 去 \n -> 归一化空白
@@ -2677,7 +2749,10 @@ function trFindOffset(map, en, fromPos) {
   // 兜底：归一化空白匹配（en 与 live 间有空格差异）
   const enNorm = en.replace(/\s+/g, ' ').trim();
   if (enNorm) {
-    const nPos = map.norm.indexOf(enNorm);
+    // level-3 也要传 fromPos（换算成 norm 下标）；否则页内重复文本会匹到更早位置 + pos 倒退连锁（3 agent 共识 bug）
+    let fromNorm = 0;
+    while (fromNorm < map.rawStart.length && map.rawStart[fromNorm] < fromPos) fromNorm++;
+    const nPos = map.norm.indexOf(enNorm, fromNorm);
     if (nPos >= 0) {
       const start = map.rawStart[nPos];
       const end = (map.rawStart[nPos + enNorm.length - 1] || start) + 1;
@@ -2694,6 +2769,19 @@ function trFindOffset(map, en, fromPos) {
       const endNo = n + enNoWs.length - 1;
       if (endNo < map.noWsToRaw.length) {
         return { start: map.noWsToRaw[n], end: map.noWsToRaw[endNo] + 1 };
+      }
+    }
+  }
+  // level5 兜底：折叠字符级差异匹配（弯直引号/dash/断词连字符；5 agent 实测 15-20% 漏句主因）
+  const enFold = trFoldStr(en);
+  if (enFold && map.fold) {
+    let fromFold = 0;
+    while (fromFold < map.foldToRaw.length && map.foldToRaw[fromFold] < fromPos) fromFold++;
+    const f = map.fold.indexOf(enFold, fromFold);
+    if (f >= 0) {
+      const endF = f + enFold.length - 1;
+      if (endF < map.foldToRaw.length) {
+        return { start: map.foldToRaw[f], end: map.foldToRaw[endF] + 1 };
       }
     }
   }
@@ -2760,8 +2848,8 @@ function trApplyPage(pageNum) {
   for (let i = 0; i < pg.pairs.length; i++) {
     const en = pg.pairs[i] && pg.pairs[i].en;
     const found = trFindOffset(map, en, pos);
-    if (found) { trWrapSentence(pageEl, found.start, found.end, i); pos = found.end; matched++; }
-    // 匹配失败：该句不可点，pos 不动（下一句从同位置继续找）
+    if (found && found.start >= pos) { trWrapSentence(pageEl, found.start, found.end, i); pos = found.end; matched++; }
+    // 匹配失败/倒退：该句不可点，pos 不动（下一句从同位置继续找）；found.start<pos 视为失败防 pos 倒退
   }
   pg.matched = matched;
 }
@@ -3146,6 +3234,13 @@ document.getElementById('reader-zoom-in').addEventListener('click', () => reader
 document.getElementById('reader-zoom-out').addEventListener('click', () => readerZoom(1 / 1.2));
 document.getElementById('reader-notes-btn').addEventListener('click', toggleReaderNotes);
 document.getElementById('reader-translate-btn').addEventListener('click', () => toggleTranslate());
+document.getElementById('reader-tr-status').addEventListener('click', () => {
+  const rs = readerState;
+  if (!rs || !rs.tr || !rs.tr.enabled) return;
+  if (!(rs.tr.done >= rs.tr.total && rs.tr.total > 0)) return; // 仅整篇就绪时可点（重译当前页）
+  const cur = currentReaderPage();
+  if (cur) trRetranslatePage(cur);
+});
 document.getElementById('reader-scroll').addEventListener('click', onReaderTrClick); // v2：点句弹 ZH
 document.getElementById('reader-notes-close').addEventListener('click', () => {
   document.getElementById('reader-notes').style.display = 'none';
@@ -3175,23 +3270,57 @@ document.getElementById('hl-delete').addEventListener('click', deleteHighlight);
 
 if ('serviceWorker' in navigator) {
   let refreshing = false;
-  const hadController = !!navigator.serviceWorker.controller; // 注册前是否有旧 SW（区分首次注册 vs 版本更新）
-  navigator.serviceWorker.addEventListener('controllerchange', () => {
-    // 新 SW 接管（skipWaiting 后触发）；仅更新场景（非首次）显示刷新横幅
-    if (refreshing || !hadController) return;
+  // P0：横幅改底部 pill（不挡阅读器顶栏 z-40），加"稍后"关闭 + 同会话不重复弹。
+  // P0：waiting 模式--发现新 SW installed 才提示，用户点"刷新"才 postMessage SKIP_WAITING
+  // 让其接管，不在阅读中途强制 reload 丢现场。
+  const showUpdateBanner = () => {
+    if (sessionStorage.getItem('sw-update-dismissed')) return;
     let b = document.getElementById('update-banner');
     if (!b) {
       b = document.createElement('div');
       b.id = 'update-banner';
-      b.textContent = '有新版本，点击刷新';
-      b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:100;background:var(--accent);color:var(--bg);text-align:center;padding:9px;font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.4)';
-      b.addEventListener('click', () => { refreshing = true; location.reload(); });
+      b.style.cssText = 'position:fixed;bottom:calc(16px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%);z-index:90;display:flex;align-items:center;gap:12px;background:var(--accent);color:var(--bg);padding:10px 14px;border-radius:10px;font-size:13px;font-weight:600;box-shadow:0 4px 16px rgba(0,0,0,0.4);max-width:92vw';
+      const label = document.createElement('span');
+      label.textContent = '有新版本';
+      const refresh = document.createElement('span');
+      refresh.textContent = '刷新';
+      refresh.style.cssText = 'text-decoration:underline;cursor:pointer';
+      refresh.addEventListener('click', () => {
+        // 通知 waiting 的 SW 接管；controllerchange 时再 reload（见下）
+        navigator.serviceWorker.getRegistration().then((reg) => {
+          if (reg && reg.waiting) reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+        });
+      });
+      const close = document.createElement('span');
+      close.textContent = '稍后';
+      close.style.cssText = 'cursor:pointer;opacity:0.75;text-decoration:underline';
+      close.addEventListener('click', () => { sessionStorage.setItem('sw-update-dismissed', '1'); b.style.display = 'none'; });
+      b.appendChild(label);
+      b.appendChild(refresh);
+      b.appendChild(close);
       document.body.appendChild(b);
     }
-    b.style.display = 'block';
+    b.style.display = 'flex';
+  };
+  // controllerchange：用户点"刷新" -> SKIP_WAITING -> 新 SW 接管 -> reload
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (refreshing) return;
+    refreshing = true;
+    location.reload();
   });
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('sw.js').catch((err) => console.warn('SW 注册失败:', err));
+    navigator.serviceWorker.register('sw.js').then((reg) => {
+      // 已有 waiting 的 SW（上次提示过但用户没刷新）直接再提示
+      if (reg.waiting) showUpdateBanner();
+      reg.addEventListener('updatefound', () => {
+        const nw = reg.installing;
+        if (!nw) return;
+        nw.addEventListener('statechange', () => {
+          // 新 SW 进入 installed 且已有旧 controller（非首次注册）才提示
+          if (nw.state === 'installed' && navigator.serviceWorker.controller) showUpdateBanner();
+        });
+      });
+    }).catch((err) => console.warn('SW 注册失败:', err));
   });
 }
 
