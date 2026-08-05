@@ -3306,6 +3306,12 @@ if ('serviceWorker' in navigator) {
   navigator.serviceWorker.addEventListener('controllerchange', () => {
     if (refreshing) return;
     refreshing = true;
+    // 存阅读现场：reload 后自动回到原论文（restoreReaderProgress 恢复页位），避免 SW 更新 reload 退出阅读器丢现场
+    try {
+      if (typeof readerState !== 'undefined' && readerState && readerState.paper && readerState.paper.id) {
+        sessionStorage.setItem('reader-restore', readerState.paper.id);
+      }
+    } catch (e) { /* sessionStorage 不可用时忽略 */ }
     location.reload();
   });
   window.addEventListener('load', () => {
@@ -3326,7 +3332,20 @@ if ('serviceWorker' in navigator) {
 
 // ===== 启动 =====
 openDB()
-  .then(() => { renderAcct(); render(); if (sbSession()) syncPull().catch((e) => console.warn('pull:', e.message)); })
+  .then(async () => {
+    renderAcct(); render();
+    if (sbSession()) syncPull().catch((e) => console.warn('pull:', e.message));
+    // SW 更新 reload 后恢复阅读现场（controllerchange 前存了 paper id）
+    try {
+      const rid = sessionStorage.getItem('reader-restore');
+      if (rid) {
+        sessionStorage.removeItem('reader-restore');
+        const all = await dbAll();
+        const p = all.find((x) => x.id === rid);
+        if (p) openReader(p);
+      }
+    } catch (e) { /* ignore */ }
+  })
   .catch((err) => {
     document.getElementById('list-queue').innerHTML =
       `<div class="empty">数据库打开失败：${escapeHtml(err && err.message ? err.message : err)}</div>`;
