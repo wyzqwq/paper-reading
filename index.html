@@ -8,7 +8,8 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="论文阅读">
 <link rel="manifest" href="manifest.webmanifest">
-<link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png">
+<!-- apple-touch-icon 内联 data URL：iOS/Mac 主屏图标不依赖外部文件路径，子路径部署无需 SW/JS 改写 -->
+<link rel="apple-touch-icon" sizes="180x180" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAALQAAAC0CAYAAAA9zQYyAAACpklEQVR4nO3aQS5EQRRAUcQSetCxK4YswtQSTC2CIUtkJiI6IaR+v+ucFdTg5lUlr04v9rvXE4g42/oA8JcETYqgSRE0KYImRdCkCJoUQZMiaFIETYqgSRE0KYImRdCkCJoUQZMiaFIETYqgSRE0KYImRdCkCJoUQZMiaFIETYqgSRE0KYImRdCkCJqU860P8NnLw/XWR+CHLm+ftj7COxOaFEGTcnRPjo9u7p63PgIHPN5fbX2EL5nQpAiaFEGTImhSBE2KoEkRNCmCJkXQpBz1pvCQY91SFU3b1prQpAialJFPjmnXIOuY0KQImhRBkyJoUgRNiqBJETQpgiZF0KSM3BT6nLTOtK2sCU2KoEkZ+eSYdg2yjglNiqBJETQpgiZF0KQImhRBkyJoUkYuVvzlWGfaEsuEJkXQpIx8cky7BlnHhCZF0KQImhRBkyJoUgRNiqBJETQpIxcr/nKsM22JZUKTImhSRj45pl2DrGNCkyJoUgRNiqBJETQpgiZF0KQImhRBkzJyU+hz0jrTtrImNCmCJmXkk2PaNcg6JjQpgiZF0KQImhRBkyJoUgRNiqBJGblY8ZdjnWlLLBOaFEGTMvLJMe0aZB0TmhRBkyJoUgRNiqBJETQpgiZF0KSMXKz4y7HOtCWWCU2KoEkZ+eSYdg2yjglNiqBJETQpgiZF0KQImhRBkyJoUgRNyshN4X/8nGQ7+j0mNCmCJmXkk8P1yyEmNCmCJkXQpAiaFEGTImhSBE2KoEkRNClHvSn8j5+Q+B0TmhRBk3J6sd+9bn0I+CsmNCmCJkXQpAiaFEGTImhSBE2KoEkRNCmCJkXQpAiaFEGTImhSBE2KoEkRNCmCJkXQpAiaFEGTImhSBE2KoEkRNCmCJkXQpAiaFEGTImhSBE3KG1jJL54VlqYtAAAAAElFTkSuQmCC">
 <title>论文阅读</title>
 <style>
   /* M7 定稿深色主题「墨纸」：暖墨黑底 + 古铜金 accent，旧书页反相 + 烫金题字感，蓝光少护眼 */
@@ -3258,15 +3259,6 @@ document.getElementById('hl-save').addEventListener('click', () => {
 document.getElementById('hl-delete').addEventListener('click', deleteHighlight);
 
 // ===== Service Worker 注册 + 更新提示（M7）=====
-// M8：iOS Safari「添加到主屏」用 manifest 图标，但把相对路径解析到域名根，
-// 子路径部署（GitHub Pages /<repo>/）下会 404。运行时把 apple-touch-icon
-// 设成基于当前 location 的绝对路径（兼容 LAN 根路径与 GitHub Pages 子路径）。
-// manifest 图标的绝对化在 sw.js fetch 拦截里做（保持 manifest URL 为真实同源 URL）。
-(function () {
-  const base = location.pathname.replace(/[^/]*$/, ''); // '/' 或 '/paper-reading/'
-  const ico = document.querySelector('link[rel=apple-touch-icon]');
-  if (ico) ico.href = base + 'icons/apple-touch-icon.png';
-})();
 
 if ('serviceWorker' in navigator) {
   let refreshing = false;
