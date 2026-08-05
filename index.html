@@ -3302,10 +3302,15 @@ if ('serviceWorker' in navigator) {
     }
     b.style.display = 'flex';
   };
+  // 防循环：本次页面若是 controllerchange reload 的结果，不再自动 reload（避免 SW 异常状态导致 reload 死循环"一直刷新"）
+  const swReloaded = sessionStorage.getItem('sw-reloaded');
+  if (swReloaded) sessionStorage.removeItem('sw-reloaded');
   // controllerchange：用户点"刷新" -> SKIP_WAITING -> 新 SW 接管 -> reload
   navigator.serviceWorker.addEventListener('controllerchange', () => {
     if (refreshing) return;
+    if (swReloaded) return; // 刚 reload 过的页面不再自动 reload（防循环）
     refreshing = true;
+    sessionStorage.setItem('sw-reloaded', '1');
     // 存阅读现场：reload 后自动回到原论文（restoreReaderProgress 恢复页位），避免 SW 更新 reload 退出阅读器丢现场
     try {
       if (typeof readerState !== 'undefined' && readerState && readerState.paper && readerState.paper.id) {
