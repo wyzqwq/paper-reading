@@ -2081,6 +2081,7 @@ async function openReader(paper, jumpPage) {
   overlay.classList.add('show');
   const scrollEl = document.getElementById('reader-scroll');
   scrollEl.innerHTML = '<div class="reader-loading">加载中…</div>';
+  trCancel(); // 取消上一篇的预译 loop，防残留/干扰（bug1）
   document.getElementById('reader-pageinfo').textContent = '';
   document.getElementById('reader-progress-fill').style.width = '0%';
 
@@ -2111,6 +2112,7 @@ async function openReader(paper, jumpPage) {
     hlDraft: null,       // 当前菜单草稿（new/edit）
     tr: null             // v2 翻译状态 {enabled, pages:{num:{pairs,ready,status}}, done, total, cancelled, keyMissing}
   };
+  trRenderStatus(); // 新 readerState.tr=null，清状态栏旧译文进度（bug1）
 
   try {
     const task = pdfjsLib.getDocument({
