@@ -1578,6 +1578,7 @@ async function syncPush() {
         const x = Object.assign({}, r, { user_id: userId });
         delete x._dirty; // 本地标记，不进 Supabase
         if (x.deleted_at === undefined) x.deleted_at = null;
+        if (table === 'annotations' && (x.note === null || x.note === undefined)) x.note = ''; // NOT NULL 兜底
         return x;
       });
       try {
@@ -2484,8 +2485,8 @@ function toast(msg, ms) {
 // 改 Edge Function 的 SYSTEM_PROMPT / DEEPSEEK_MODEL 时同步 bump（'v2'/'v3'...），旧缓存 hash 不符自动失效重译。
 const TR_CACHE_VERSION = 'ctx1'; // bump: 加跨页上下文 <ctx_*> + 分块翻译，旧缓存 hash 不符自动失效重译
 
-// 分块上限：4000 边界偶发 504/546（p8 3971 失败/p7 3953 成功，DeepSeek 响应波动），2000 更稳
-const TR_CHUNK_SIZE = 2000;
+// 分块上限：2000 时 body 含 ctx 标记可达 2100+，偶发 546（p3 chunk1 2132 失败/p2 2118 成功，DeepSeek 响应波动），1500 更稳
+const TR_CHUNK_SIZE = 1500;
 
 // 把页文本按段落+句号切成 <= maxChunk 的块，每块独立调代理（避整页超时）；以句边界切，不切断句
 function trSplitText(text, maxChunk) {
@@ -2558,19 +2559,41 @@ async function sha256Hex(text) {
 }
 
 // 单次调 translate-proxy（带 JWT；sbFetch 自动 401 刷新）。text 可含 <ctx_*> 上下文标记
+// 504/546/502（网关超时/DeepSeek 偶发波动）2s 后重试 1 次；其他错误（401/400/429）不重试直接抛
 async function trCallProxySingle(text) {
   const s = sbSession();
   if (!s) throw new Error('未登录');
   const headers = sbHeaders(s.access_token);
   headers['Content-Type'] = 'application/json';
-  const res = await sbFetch(SUPABASE_URL + '/functions/v1/translate-proxy', {
-    method: 'POST', headers, body: JSON.stringify({ text })
-  });
-  let data = null;
-  try { data = await res.json(); } catch (e) { /* ignore */ }
-  if (!res.ok) throw new Error((data && data.error) || ('翻译失败 (' + res.status + ')'));
-  if (!data || !Array.isArray(data.sentences)) throw new Error('翻译返回格式异常');
-  return data.sentences; // [{en,zh}]
+  const url = SUPABASE_URL + '/functions/v1/translate-proxy';
+  const body = JSON.stringify({ text });
+  let lastErr = null;
+  for (let attempt = 0; attempt < 2; attempt++) { // 首调 + 1 retry
+    const rs = readerState;
+    if (rs && rs.tr && (rs.tr.cancelled || !rs.tr.enabled)) throw new Error('已取消');
+    let res;
+    try { res = await sbFetch(url, { method: 'POST', headers, body }); }
+    catch (e) { // fetch 网络层抛错，retry 1 次
+      lastErr = e;
+      if (attempt === 0) { await new Promise((r) => setTimeout(r, 2000)); continue; }
+      throw e;
+    }
+    let data = null;
+    try { data = await res.json(); } catch (e) { /* ignore */ }
+    if (res.ok) {
+      if (data && Array.isArray(data.sentences)) return data.sentences;
+      throw new Error('翻译返回格式异常'); // 格式错不重试
+    }
+    const retryable = res.status === 504 || res.status === 546 || res.status === 502;
+    lastErr = new Error((data && data.error) || ('翻译失败 (' + res.status + ')'));
+    if (retryable && attempt === 0) {
+      console.log('[tr] chunk 状态 ' + res.status + '，2s 后重试');
+      await new Promise((r) => setTimeout(r, 2000));
+      continue;
+    }
+    throw lastErr;
+  }
+  throw lastErr || new Error('翻译失败');
 }
 
 // 翻译整页文本：分块（避超时 504）+ 跨页上下文（首块带 prevCtx、末块带 nextCtx，<ctx_*> 标记供 Edge Function 识别只译 <page>）
@@ -3259,7 +3282,7 @@ async function saveHighlight(color, note) {
   const anno = {
     id: uid(), paper_id: rs.paper.id, page: draft.pageNum, text: draft.text,
     start_offset: draft.start, end_offset: draft.end,
-    color: color || 'yellow', note: note || null, created_at: nowISO()
+    color: color || 'yellow', note: note || '', created_at: nowISO()
   };
   try { await dbPutAnno(anno); rs.annos.push(anno); applyHighlights(draft.pageNum); }
   catch (e) { alert('保存高亮失败：' + (e && e.message ? e.message : e)); }
@@ -3275,7 +3298,7 @@ async function updateHighlight(color, note) {
   const anno = rs.annos.find((a) => a.id === draft.annoId);
   if (!anno) return;
   anno.color = color || anno.color;
-  anno.note = note || null;
+  anno.note = note || '';
   try { await dbPutAnno(anno); } catch (e) { alert('更新失败：' + (e && e.message ? e.message : e)); }
   applyHighlights(anno.page);
   hideHlMenu();
