@@ -2542,7 +2542,9 @@ function trRenderStatus() {
   btn.setAttribute('aria-pressed', 'true');
   const tr = rs.tr;
   const done = tr.done >= tr.total && tr.total > 0;
-  let txt = done ? ('译文就绪 ' + tr.total + ' 页') : ('翻译中 ' + tr.done + '/' + tr.total);
+  const failed = tr.failed || 0;
+  let txt = done ? ('译文就绪 ' + tr.total + ' 页') : ((tr.finished ? '部分就绪 ' : '翻译中 ') + tr.done + '/' + tr.total);
+  if (failed > 0) txt += '（失败 ' + failed + ' 页）';
   // 整篇就绪时附当前页匹配率（漏句可见；可点重译）
   if (done) {
     const cur = currentReaderPage();
@@ -2567,6 +2569,7 @@ async function trEnsurePairs(pageNum) {
   const cached = await dbGetTranslation(paperId, pageNum).catch(() => null);
   const text = await trExtractPageText(pageNum);
   const hash = await sha256Hex(TR_CACHE_VERSION + text);
+  console.log('[tr] p' + pageNum, 'cached=' + !!cached, 'cHash=' + (cached && cached.source_hash || '').slice(0,12), 'nHash=' + hash.slice(0,12), 'match=' + (cached && cached.source_hash === hash), 'textLen=' + text.length);
   if (cached && cached.source_hash === hash && Array.isArray(cached.pairs)) {
     // 命中缓存（含空页空 pairs 占位）零调用；pairs 可能空（空页）但 hash 一致即视为有效
     tr.pages[pageNum] = { pairs: cached.pairs, ready: true, status: 'ready' };
@@ -2576,14 +2579,17 @@ async function trEnsurePairs(pageNum) {
   if (!text.trim()) {
     const pairs = [];
     await dbPutTranslation({ id: (cached && cached.id) || uid(), user_id: userId, paper_id: paperId, page_num: pageNum, pairs, source_hash: hash });
+    console.log('[tr] p' + pageNum, '空页存空占位');
     tr.pages[pageNum] = { pairs, ready: true, status: 'ready' };
     return { pairs, fromCache: false };
   }
   tr.pages[pageNum] = Object.assign(tr.pages[pageNum] || {}, { status: 'translating' });
   trRenderStatus();
   const pairs = await trCallProxy(text);
+  console.log('[tr] p' + pageNum, '代理返回 pairs=' + (pairs ? pairs.length : 'null'));
   if (!rs.tr || rs.tr.cancelled) return null; // 调用期间被取消
   await dbPutTranslation({ id: (cached && cached.id) || uid(), user_id: userId, paper_id: paperId, page_num: pageNum, pairs, source_hash: hash });
+  console.log('[tr] p' + pageNum, 'dbPut 成功');
   tr.pages[pageNum] = { pairs, ready: true, status: 'ready' };
   return { pairs, fromCache: false };
 }
@@ -2621,6 +2627,8 @@ async function trPretranslateLoop() {
   const tr = rs.tr;
   tr.total = rs.numPages;
   tr.done = 0;
+  tr.failed = 0;
+  tr.finished = false;
   trRenderStatus();
   for (let i = 1; i <= rs.numPages; i++) {
     if (tr.cancelled || !tr.enabled) break;
@@ -2629,15 +2637,16 @@ async function trPretranslateLoop() {
       if (r) { tr.done = i; trRenderStatus(); trApplyPage(i); } // Task6 渲染该页叠层
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
+      console.log('[tr] p' + i, '失败:', msg);
       tr.pages[i] = { pairs: [], ready: false, status: 'error', error: msg };
-      tr.done = i;
+      tr.failed = (tr.failed || 0) + 1; // 修A：失败不计入 done，状态栏不再假"译完"
       trRenderStatus();
       // key 无效/未设置/未登录：后续都会失败，停整篇预译
       if (/未设置|key 无效|未登录/.test(msg)) { tr.keyMissing = /未设置|未登录/.test(msg); trApplyError(msg); break; }
       trApplyError('第 ' + i + ' 页翻译失败：' + msg);
     }
   }
-  if (!tr.cancelled && tr.enabled) trRenderStatus();
+  if (!tr.cancelled && tr.enabled) { tr.finished = true; trRenderStatus(); }
 }
 
 // 开关（opt-in；读英文论文不花钱）
@@ -2652,6 +2661,8 @@ async function toggleTranslate(forceState) {
     rs.tr.enabled = true;
     rs.tr.cancelled = false;
     rs.tr.keyMissing = false;
+    rs.tr.failed = 0;
+    rs.tr.finished = false;
     rs.tr.pages = rs.tr.pages || {};
     trRenderStatus();
     await trPretranslateLoop();
