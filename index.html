@@ -246,6 +246,7 @@
   }
   /* v2 翻译：已译句可点叠层（极淡 jade 下划线提示可点）+ 点句高亮底 + ZH 浮层 */
   .textLayer span.tr-sent {
+    position: static; /* 覆盖 .textLayer span 的 absolute，保持 inline（同 mark.hl），下划线对齐正确文本 */
     cursor: pointer; border-radius: 1px;
     border-bottom: 1px solid var(--jade-line);
     -webkit-tap-highlight-color: transparent;
@@ -2649,7 +2650,17 @@ function trBuildTextMap(pageNum) {
       norm += raw[i]; rawStart.push(i); i++;
     }
   }
-  return { raw, norm, rawStart };
+  // level4 用：去全部空白 + 每个 noWs 字符对应的 raw 偏移
+  // 解决行界错配--trExtractPageText 在 hasEOL 处插 \n 喂 LLM，LLM 可能把 \n 规范化成空格返回 en，
+  // 而 live 文本（raw）行界处无空格；前 3 级匹配都过不了，去全部空白才能匹上。
+  let noWs = '';
+  const noWsToRaw = [];
+  for (let j = 0; j < raw.length; j++) {
+    if (isWs(raw[j])) continue;
+    noWs += raw[j];
+    noWsToRaw.push(j);
+  }
+  return { raw, norm, rawStart, noWs, noWsToRaw };
 }
 
 // 在 map.raw 里从 fromPos 起找 en 句的 [start,end)。三级匹配：原样 -> 去 \n -> 归一化空白
@@ -2671,6 +2682,19 @@ function trFindOffset(map, en, fromPos) {
       const start = map.rawStart[nPos];
       const end = (map.rawStart[nPos + enNorm.length - 1] || start) + 1;
       return { start, end };
+    }
+  }
+  // level4 兜底：去全部空白匹配（en 行界带空格、live 行界无空格时前 3 级都失败）
+  const enNoWs = en.replace(/\s+/g, '');
+  if (enNoWs && map.noWs) {
+    let fromNo = 0;
+    while (fromNo < map.noWsToRaw.length && map.noWsToRaw[fromNo] < fromPos) fromNo++;
+    const n = map.noWs.indexOf(enNoWs, fromNo);
+    if (n >= 0) {
+      const endNo = n + enNoWs.length - 1;
+      if (endNo < map.noWsToRaw.length) {
+        return { start: map.noWsToRaw[n], end: map.noWsToRaw[endNo] + 1 };
+      }
     }
   }
   return null;
