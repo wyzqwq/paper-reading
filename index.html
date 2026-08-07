@@ -190,8 +190,9 @@
   .reader-error { color: var(--danger); }
   /* textLayer（M4）：透明文字层，盖在 canvas 上让文字可选/可高亮。
      pdf.js v6 的 bare TextLayer API 不注入 CSS（adoptedStyleSheets 为空），需宿主页提供官方
-     textLayer 规则：把 pdf.js 设到 span 上的 --font-height / --scale-x 转成 font-size / transform，
-     否则 span 用默认字号、无 transform -> 溢出容器被 overflow:hidden 裁掉 -> 高亮 mark 不可见。
+     textLayer 规则（position/overflow/transform-origin 等）。pdf.js v6 在 span inline style 直接设
+     left/top/fontSize/fontFamily/transform，宿主只需设 --scale-factor（按 zoom 动态写，见 renderTextLayer）
+     供 inline calc 解析；旧版的 --font-height/--scale-x CSS 变量机制 v6 已弃用。
      规则取自 pdfjs-dist@6.2.108 web/pdf_viewer.css 的 .textLayer 块。 */
   .textLayer {
     position: absolute; inset: 0; overflow: clip; line-height: 1;
@@ -201,11 +202,9 @@
        text_layer_builder.css，caret-color:CanvasText 告知 iOS 这是文本选区上下文 */
     caret-color: CanvasText; letter-spacing: normal; word-spacing: normal;
     color-scheme: only light; transform-origin: 0 0;
-    /* pdf.js v6 TextLayer 需要的 CSS 变量（--total-scale-factor 按 zoom 动态写，见 renderTextLayer） */
+    /* --scale-factor 按 zoom 动态写（见 renderTextLayer），pdf.js v6 span inline left/top/fontSize 全依赖它。
+       --scale-round-x/y 官方 setLayerDimensions 用（round() 降采样对齐像素），fallback 1px，此处显式设同值。 */
     --scale-round-x: 1px; --scale-round-y: 1px;
-    --min-font-size: 1;
-    --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
-    --min-font-size-inv: calc(1 / var(--min-font-size));
   }
   .textLayer span, .textLayer br {
     /* M7: color:transparent 与官方 text_layer_builder.css 一致。iOS Safari 的 WKTextInteraction
@@ -218,15 +217,11 @@
     transform-origin: 0% 0%;
     -webkit-user-select: text; user-select: text;
   }
-  /* 叶子 span 的字号 / 缩放：pdf.js 在每个 span 上设 --font-height / --scale-x，靠这两条转成渲染 */
+  /* 叶子 span：pdf.js v6 在 span inline style 直接设 left/top/fontSize/fontFamily/transform，
+     宿主只需给 z-index（官方 text_layer_builder.css）。旧版 --font-height/--scale-x 变量机制 v6 已弃用。 */
   .textLayer > :not(.markedContent),
   .textLayer .markedContent span:not(.markedContent) {
     z-index: 1; /* pdf.js 官方：leaf span z-index:1，在 endOfContent(z-index:0) 之上 */
-    --font-height: 0;
-    font-size: calc(var(--text-scale-factor) * var(--font-height));
-    --scale-x: 1;
-    --rotate: 0deg;
-    transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
   }
   .textLayer .markedContent { display: contents; }
   .textLayer ::selection { background: rgba(201,169,110,0.35); }
@@ -2264,9 +2259,12 @@ async function renderTextLayer(canvas, cssScale) {
     const vpCss = page.getViewport({ scale: cssScale });
     const container = canvas._textLayerDiv;
     container.innerHTML = '';
-    // pdf.js v6 TextLayer 的 font-size/容器尺寸算式依赖 --total-scale-factor（= viewport.scale），
-    // 不设则 calc 失效、容器塌成 0×0 + overflow:hidden 把 span 全裁掉 -> 文字选不中
-    container.style.setProperty('--total-scale-factor', cssScale);
+    // pdf.js v6 TextLayer 给每个 span 设 inline left/top/fontSize = calc(var(--scale-factor)*Npx)，
+    // --scale-factor 是宿主职责（官方 viewer 由 PDFPageView 设；bare TextLayer API 不设）。
+    // 不设则 calc invalid -> fontSize 回退默认 16px -> span 文字宽度与 canvas 字形不匹配
+    // -> 双击选中区与单词偏移（复制仍正确，因 left/top 定位大致对）。真浏览器实测：设 --scale-factor
+    // 后正文 9.84px/标题 23.04px（匹配 canvas）；旧代码误设 --total-scale-factor（v6 不读此变量）仍 16px。
+    container.style.setProperty('--scale-factor', cssScale);
     let tc = rs.textContentCache[pageNum];
     if (!tc) {
       // M7: iOS Safari 不支持 ReadableStream 的 async iteration（for await...of 抛 TypeError "undefined is not a function"），
@@ -2900,7 +2898,7 @@ function trFindOffset(map, en, fromPos) {
 }
 
 // 把 [start,end) 包成 tr-sent 片段（同 M4 wrapTextRange 的 TreeWalker 分段，但用 span + data-pair，
-// 留在各自 textLayer span 内继承 --font-height/--scale-x）
+// 留在各自 textLayer span 内继承 inline font-size/transform）
 function trWrapSentence(pageEl, start, end, pairIdx) {
   if (end <= start) return false;
   const walker = document.createTreeWalker(pageEl, NodeFilter.SHOW_TEXT);
@@ -3055,9 +3053,9 @@ function applyHighlights(pageNum) {
 
 // 把 [start,end) 字符范围包进 <mark>。按文本节点分段：每段各自 surroundContents 一个 mark
 // （同一 anno 的所有 mark 共享 data-annoId / 颜色 / 批注）。这样每个 mark 都留在各自 span 内，
-// 继承 span 的 font-size / transform（--font-height / --scale-x），跨 span / 跨行高亮也能渲染。
+// 继承 span 的 inline font-size / transform，跨 span / 跨行高亮也能渲染。
 // （旧实现跨节点时退回 extractContents+insertNode，会把 mark 插成 .textLayer 直接子节点，
-// 拿不到 span 上的 CSS 变量 -> font-size 塌 0、宽度 0 -> 视觉不可见。Bug C）
+// 拿不到 span 的 inline 字号/变换 -> 视觉不可见。Bug C）
 function wrapTextRange(pageEl, start, end, anno) {
   if (end <= start) return false;
   const walker = document.createTreeWalker(pageEl, NodeFilter.SHOW_TEXT);
