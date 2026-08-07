@@ -205,6 +205,13 @@
     /* --scale-factor 按 zoom 动态写（见 renderTextLayer），pdf.js v6 span inline left/top/fontSize 全依赖它。
        --scale-round-x/y 官方 setLayerDimensions 用（round() 降采样对齐像素），fallback 1px，此处显式设同值。 */
     --scale-round-x: 1px; --scale-round-y: 1px;
+    /* pdf.js v6.2.108 官方 pdf_viewer.css 变量链：宿主设 --total-scale-factor（按 zoom 动态写，见 renderTextLayer），
+       派生 --text-scale-factor = total × min-font-size；leaf span font-size = text-scale-factor × --font-height（span inline 设）。
+       旧注释"--font-height/--scale-x 已弃用、需设 --scale-factor"是错的：实测 v6.2.108 span inline 仍设 --font-height/--scale-x，
+       源码不含 --scale-factor。漏写 font-size/transform 规则会让 fontSize 回退 16px、无 scaleX，致选区与 canvas 文字错位。 */
+    --min-font-size: 1;
+    --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+    --min-font-size-inv: calc(1 / var(--min-font-size));
   }
   .textLayer span, .textLayer br {
     /* M7: color:transparent 与官方 text_layer_builder.css 一致。iOS Safari 的 WKTextInteraction
@@ -217,11 +224,17 @@
     transform-origin: 0% 0%;
     -webkit-user-select: text; user-select: text;
   }
-  /* 叶子 span：pdf.js v6 在 span inline style 直接设 left/top/fontSize/fontFamily/transform，
-     宿主只需给 z-index（官方 text_layer_builder.css）。旧版 --font-height/--scale-x 变量机制 v6 已弃用。 */
+  /* 叶子 span：pdf.js v6.2.108 在 span inline style 设 left/top(百分比)/--font-height/--scale-x/font-family，
+     宿主 CSS 提供 font-size:calc(var(--text-scale-factor)*var(--font-height)) 与 transform:scaleX(var(--scale-x))
+     （官方 pdf_viewer.css 规则，见 .textLayer 变量链）。漏这两条则 fontSize 回退 16px、无 scaleX -> 选区错位。 */
   .textLayer > :not(.markedContent),
   .textLayer .markedContent span:not(.markedContent) {
     z-index: 1; /* pdf.js 官方：leaf span z-index:1，在 endOfContent(z-index:0) 之上 */
+    --font-height: 0;
+    font-size: calc(var(--text-scale-factor) * var(--font-height));
+    --scale-x: 1;
+    --rotate: 0deg;
+    transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
   }
   .textLayer .markedContent { display: contents; }
   .textLayer ::selection { background: rgba(201,169,110,0.35); }
@@ -2307,12 +2320,11 @@ async function renderTextLayer(canvas, cssScale) {
     const vpCss = page.getViewport({ scale: cssScale });
     const container = canvas._textLayerDiv;
     container.innerHTML = '';
-    // pdf.js v6 TextLayer 给每个 span 设 inline left/top/fontSize = calc(var(--scale-factor)*Npx)，
-    // --scale-factor 是宿主职责（官方 viewer 由 PDFPageView 设；bare TextLayer API 不设）。
-    // 不设则 calc invalid -> fontSize 回退默认 16px -> span 文字宽度与 canvas 字形不匹配
-    // -> 双击选中区与单词偏移（复制仍正确，因 left/top 定位大致对）。真浏览器实测：设 --scale-factor
-    // 后正文 9.84px/标题 23.04px（匹配 canvas）；旧代码误设 --total-scale-factor（v6 不读此变量）仍 16px。
-    container.style.setProperty('--scale-factor', cssScale);
+    // pdf.js v6.2.108 官方 pdf_viewer.css 变量链：宿主设 --total-scale-factor，派生 --text-scale-factor，
+    // leaf span font-size = text-scale-factor × --font-height（span inline 设），transform scaleX(var(--scale-x))。
+    // 不设则 calc 里 --total-scale-factor 为空 -> font-size 回退 16px、无 scaleX -> 选区与 canvas 文字错位。
+    // （旧代码误设 --scale-factor，官方不读此变量名；bf24844 的修复方向错了，本次纠正。）
+    container.style.setProperty('--total-scale-factor', cssScale);
     let tc = rs.textContentCache[pageNum];
     if (!tc) {
       // M7: iOS Safari 不支持 ReadableStream 的 async iteration（for await...of 抛 TypeError "undefined is not a function"），
