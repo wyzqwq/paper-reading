@@ -2559,7 +2559,8 @@ async function sha256Hex(text) {
 }
 
 // 单次调 translate-proxy（带 JWT；sbFetch 自动 401 刷新）。text 可含 <ctx_*> 上下文标记
-// 504/546/502（网关超时/DeepSeek 偶发波动）2s 后重试 1 次；其他错误（401/400/429）不重试直接抛
+// 504/546/502（DeepSeek 偶发慢导致网关超时，非长度）递增 backoff 重试 3 次（2s/4s/6s，等 DeepSeek 恢复）；
+// 其他错误（401/400/429）不重试直接抛
 async function trCallProxySingle(text) {
   const s = sbSession();
   if (!s) throw new Error('未登录');
@@ -2568,14 +2569,14 @@ async function trCallProxySingle(text) {
   const url = SUPABASE_URL + '/functions/v1/translate-proxy';
   const body = JSON.stringify({ text });
   let lastErr = null;
-  for (let attempt = 0; attempt < 2; attempt++) { // 首调 + 1 retry
+  for (let attempt = 0; attempt < 4; attempt++) { // 首调 + 3 retry
     const rs = readerState;
     if (rs && rs.tr && (rs.tr.cancelled || !rs.tr.enabled)) throw new Error('已取消');
     let res;
     try { res = await sbFetch(url, { method: 'POST', headers, body }); }
-    catch (e) { // fetch 网络层抛错，retry 1 次
+    catch (e) { // fetch 网络层抛错，retry
       lastErr = e;
-      if (attempt === 0) { await new Promise((r) => setTimeout(r, 2000)); continue; }
+      if (attempt < 3) { await new Promise((r) => setTimeout(r, 2000 * (attempt + 1))); continue; }
       throw e;
     }
     let data = null;
@@ -2586,9 +2587,10 @@ async function trCallProxySingle(text) {
     }
     const retryable = res.status === 504 || res.status === 546 || res.status === 502;
     lastErr = new Error((data && data.error) || ('翻译失败 (' + res.status + ')'));
-    if (retryable && attempt === 0) {
-      console.log('[tr] chunk 状态 ' + res.status + '，2s 后重试');
-      await new Promise((r) => setTimeout(r, 2000));
+    if (retryable && attempt < 3) {
+      const backoff = 2000 * (attempt + 1); // 2s, 4s, 6s
+      console.log('[tr] chunk 状态 ' + res.status + '，' + (backoff / 1000) + 's 后重试 (' + (attempt + 1) + '/3)');
+      await new Promise((r) => setTimeout(r, backoff));
       continue;
     }
     throw lastErr;
