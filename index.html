@@ -242,12 +242,16 @@
   }
   /* v2 翻译：已译句可点叠层（极淡 jade 下划线提示可点）+ 点句高亮底 + ZH 浮层 */
   .textLayer span.tr-sent {
-    position: static; /* 覆盖 .textLayer span 的 absolute，保持 inline（同 mark.hl），下划线对齐正确文本 */
+    position: static; /* 覆盖 .textLayer span 的 absolute，保持 inline（同 mark.hl），点击命中用 */
     cursor: pointer; border-radius: 1px;
-    border-bottom: 1px solid var(--jade-line);
     -webkit-tap-highlight-color: transparent;
   }
-  .textLayer span.tr-sent.tr-active { background: var(--jade-bg); border-bottom-color: var(--jade); }
+  .textLayer span.tr-sent.tr-active { background: var(--jade-bg); }
+  /* v2 翻译句内连续底线（overlay）：pdf.js 每词一 span，tr-sent 片段间有词间 gap，
+     border-bottom 会断续；改用绝对定位 overlay 层按句每行画连续 1px 线覆盖 gap */
+  .textLayer .tr-underline-layer { position: absolute; inset: 0; pointer-events: none; }
+  .textLayer .tr-underline { position: absolute; height: 1px; background: var(--jade-line); pointer-events: none; }
+  .textLayer .tr-underline.tr-active { background: var(--jade); }
   .reader-tr-popup {
     position: fixed; z-index: 60; max-width: 84vw;
     background: var(--surface-2); color: var(--jade);
@@ -2939,6 +2943,7 @@ function trUnwrapPage(pageEl) {
     parent.removeChild(sp);
     parent.normalize();
   });
+  pageEl.querySelectorAll('.tr-underline-layer').forEach((l) => l.remove());
 }
 
 // 应用某页译文叠层（pairs 就绪后调；缩放重建 textLayer 后也调）
@@ -2961,6 +2966,55 @@ function trApplyPage(pageNum) {
     // 匹配失败/倒退：该句不可点，pos 不动（下一句从同位置继续找）；found.start<pos 视为失败防 pos 倒退
   }
   pg.matched = matched;
+  trPaintUnderlines(pageEl);
+}
+
+// 画句内连续底线（overlay）：pdf.js 每词一 span，tr-sent 片段间有词间 gap，
+// border-bottom 会断续；改在 textLayer 上叠绝对定位层，按 data-pair 分组每行画一条 1px 线覆盖 gap。
+// layer insertBefore(endOfContent) 保持 endOfContent=lastChild（M7 reset 依赖）；reset 的 append(endOfContent) 也会自动维持顺序。
+function trPaintUnderlines(pageEl) {
+  if (!pageEl) return;
+  pageEl.querySelectorAll('.tr-underline-layer').forEach((l) => l.remove());
+  const sents = pageEl.querySelectorAll('span.tr-sent');
+  if (!sents.length) return;
+  const endOf = pageEl.querySelector('.endOfContent');
+  const layer = document.createElement('div');
+  layer.className = 'tr-underline-layer';
+  pageEl.insertBefore(layer, endOf); // endOf 为 null 时等价 appendChild
+  const cRect = pageEl.getBoundingClientRect();
+  const groups = new Map();
+  sents.forEach((s) => {
+    const k = s.dataset.pair;
+    if (!groups.has(k)) groups.set(k, []);
+    const r = s.getBoundingClientRect();
+    groups.get(k).push({ x: r.left - cRect.left, y: r.top - cRect.top, w: r.width, h: r.height });
+  });
+  for (const [k, rects] of groups) {
+    if (!rects.length) continue;
+    rects.sort((a, b) => a.y - b.y || a.x - b.x);
+    const rows = [];
+    for (const r of rects) {
+      const last = rows[rows.length - 1];
+      if (last && Math.abs(r.y - last.y) < 3) {
+        last.segs.push(r);
+        last.minX = Math.min(last.minX, r.x);
+        last.maxEnd = Math.max(last.maxEnd, r.x + r.w);
+        last.y = Math.min(last.y, r.y);
+        last.h = Math.max(last.h, r.h);
+      } else {
+        rows.push({ y: r.y, h: r.h, minX: r.x, maxEnd: r.x + r.w, segs: [r] });
+      }
+    }
+    for (const row of rows) {
+      const ul = document.createElement('div');
+      ul.className = 'tr-underline';
+      ul.dataset.pair = k;
+      ul.style.left = row.minX + 'px';
+      ul.style.top = (row.y + row.h - 1) + 'px';
+      ul.style.width = (row.maxEnd - row.minX) + 'px';
+      layer.appendChild(ul);
+    }
+  }
 }
 
 // 隐藏所有译文叠层 + ZH 浮层（关开关 / 关阅读器）
@@ -2981,7 +3035,10 @@ function trHidePopup() {
   if (pop) pop.style.display = 'none';
   if (trActivePair && readerState && readerState.textLayers) {
     const tl = readerState.textLayers[trActivePair.pageNum];
-    if (tl) tl.container.querySelectorAll('span.tr-sent.tr-active').forEach((s) => s.classList.remove('tr-active'));
+    if (tl) {
+      tl.container.querySelectorAll('span.tr-sent.tr-active').forEach((s) => s.classList.remove('tr-active'));
+      tl.container.querySelectorAll('.tr-underline.tr-active').forEach((s) => s.classList.remove('tr-active'));
+    }
   }
   trActivePair = null;
 }
@@ -2997,7 +3054,10 @@ function trShowPopup(pageNum, pairIdx, anchorEl) {
   pop.textContent = zh;
   pop.style.display = 'block';
   const tl = rs.textLayers && rs.textLayers[pageNum];
-  if (tl) tl.container.querySelectorAll('span.tr-sent[data-pair="' + pairIdx + '"]').forEach((s) => s.classList.add('tr-active'));
+  if (tl) {
+    tl.container.querySelectorAll('span.tr-sent[data-pair="' + pairIdx + '"]').forEach((s) => s.classList.add('tr-active'));
+    tl.container.querySelectorAll('.tr-underline[data-pair="' + pairIdx + '"]').forEach((s) => s.classList.add('tr-active'));
+  }
   trActivePair = { pageNum, idx: pairIdx };
   // 定位：锚点片段视口矩形下方居中；不够则上方；再夹在视口内
   const r = anchorEl.getBoundingClientRect();
