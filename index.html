@@ -793,6 +793,48 @@ function dbGetAllTranslations(paperId) {
   });
 }
 
+// 软删某论文全部译文（删论文时调用；单事务批量，含同 page 多设备多行不去重）
+function dbDeleteTranslationsByPaper(paperId) {
+  return new Promise((resolve, reject) => {
+    const t = db.transaction('translations', 'readwrite');
+    const s = t.objectStore('translations');
+    const now = nowISO();
+    const req = s.index('paper_id').getAll(paperId);
+    req.onsuccess = () => {
+      const rows = (req.result || []).filter((r) => !r.deleted_at);
+      for (const r of rows) { r.deleted_at = now; r.updated_at = now; r._dirty = true; s.put(r); }
+    };
+    req.onerror = () => reject(req.error);
+    t.oncomplete = () => { if (req.result && req.result.length) schedulePush(); resolve(); };
+    t.onerror = () => reject(t.error);
+  });
+}
+
+// 清孤儿译文：paper_id 不在 live papers（已软删或不存在）的译文行软删。syncPull 后调（本地 papers 已最新）。
+function trPurgeOrphans() {
+  return new Promise((resolve, reject) => {
+    const t = db.transaction(['papers', 'translations'], 'readwrite');
+    const ps = t.objectStore('papers');
+    const ts = t.objectStore('translations');
+    const now = nowISO();
+    let orphans = 0;
+    const gp = ps.getAll();
+    gp.onsuccess = () => {
+      const live = new Set((gp.result || []).filter((p) => !p.deleted_at).map((p) => p.id));
+      const gt = ts.getAll();
+      gt.onsuccess = () => {
+        const rows = (gt.result || []).filter((r) => !r.deleted_at && !live.has(r.paper_id));
+        orphans = rows.length;
+        for (const r of rows) { r.deleted_at = now; r.updated_at = now; r._dirty = true; ts.put(r); }
+      };
+      gt.onerror = () => reject(gt.error);
+    };
+    gp.onerror = () => reject(gp.error);
+    t.oncomplete = () => { if (orphans) schedulePush(); resolve(orphans); };
+    t.onerror = () => reject(t.error);
+  });
+}
+
 // user_secrets store（v2 §11.3）：DeepSeek key，单行/用户。key=user_id
 // {user_id, deepseek_key, updated_at, _dirty}；跨设备共享（Mac 填过 iPhone 不用重填）
 function secretStore(mode) { return db.transaction('user_secrets', mode).objectStore('user_secrets'); }
@@ -1074,6 +1116,7 @@ async function del(p) {
   await dbDeleteFile(p.id).catch(() => {}); // 本地 PDF 二进制一并删
   if (sbSession()) await sbDeletePdf(p.id).catch(() => {}); // Storage 对象一并删
   await dbDeleteAnnosByPaper(p.id).catch(() => {}); // 高亮批注一并删
+  await dbDeleteTranslationsByPaper(p.id).catch(() => {}); // 逐页译文缓存一并软删（防孤儿泄漏）
   render();
 }
 
@@ -1556,6 +1599,7 @@ async function syncPull() {
       }
     }
   } catch (e) { console.warn('pull user_secrets err:', e.message); }
+  await trPurgeOrphans().catch((e) => console.warn('purge orphans:', e.message)); // 清孤儿译文（paper 已删但译文残留）
   render();
   renderTranslateSection(); // v2：拉到 key 后刷新设置页（若打开）
 }
