@@ -255,8 +255,8 @@
   }
   /* v2 翻译：已译句可点叠层（极淡 jade 下划线提示可点）+ 点句高亮底 + ZH 浮层 */
   .textLayer span.tr-sent {
-    position: static; /* 覆盖 .textLayer span 的 absolute，保持 inline（同 mark.hl），点击命中用 */
-    cursor: pointer; border-radius: 1px;
+    position: static; /* 覆盖 .textLayer span 的 absolute，保持 inline（同 mark.hl） */
+    cursor: text; border-radius: 1px; /* P2：去 pointer，句尾图标承担点击，tr-sent 回归可选词文本 */
     -webkit-tap-highlight-color: transparent;
   }
   .textLayer span.tr-sent.tr-active { background: var(--jade-bg); }
@@ -265,6 +265,15 @@
   .textLayer .tr-underline-layer { position: absolute; inset: 0; pointer-events: none; }
   .textLayer .tr-underline { position: absolute; height: 1px; background: var(--jade-line); pointer-events: none; }
   .textLayer .tr-underline.tr-active { background: var(--jade); }
+  /* P2 句尾图标：overlay 层内独立可点小图标（书页角 SVG，古铜金），单击弹该句译文，绕开 textLayer 选词冲突 */
+  .textLayer .tr-icon {
+    position: absolute; pointer-events: auto; cursor: pointer;
+    width: 14px; height: 14px; opacity: 0.55;
+    -webkit-tap-highlight-color: transparent;
+    transition: opacity .12s;
+  }
+  .textLayer .tr-icon:hover, .textLayer .tr-icon.tr-icon-active { opacity: 1; }
+  .textLayer .tr-icon svg { width: 100%; height: 100%; display: block; stroke: var(--accent); fill: none; stroke-width: 1.2; stroke-linejoin: round; }
   .reader-tr-popup {
     position: fixed; z-index: 60; max-width: 84vw;
     background: var(--surface-2); color: var(--jade);
@@ -3070,6 +3079,16 @@ function trPaintUnderlines(pageEl) {
       ul.style.width = (row.maxEnd - row.minX) + 'px';
       layer.appendChild(ul);
     }
+    // P2：句尾图标 -- 末行右端外侧放书页角小图标，单击弹该句译文（绕开 textLayer 选词冲突）
+    const lastRow = rows[rows.length - 1];
+    const icon = document.createElement('div');
+    icon.className = 'tr-icon';
+    icon.dataset.pair = k;
+    icon.title = '查看译文';
+    icon.style.left = (lastRow.maxEnd + 2) + 'px';
+    icon.style.top = (lastRow.y + lastRow.h / 2 - 7) + 'px';
+    icon.innerHTML = '<svg viewBox="0 0 14 14"><path d="M3 2 H9 L11 4 V12 H3 Z"/><path d="M9 2 V4 H11"/></svg>';
+    layer.appendChild(icon);
   }
 }
 
@@ -3094,6 +3113,7 @@ function trHidePopup() {
     if (tl) {
       tl.container.querySelectorAll('span.tr-sent.tr-active').forEach((s) => s.classList.remove('tr-active'));
       tl.container.querySelectorAll('.tr-underline.tr-active').forEach((s) => s.classList.remove('tr-active'));
+      tl.container.querySelectorAll('.tr-icon.tr-icon-active').forEach((s) => s.classList.remove('tr-icon-active'));
     }
   }
   trActivePair = null;
@@ -3113,6 +3133,7 @@ function trShowPopup(pageNum, pairIdx, anchorEl) {
   if (tl) {
     tl.container.querySelectorAll('span.tr-sent[data-pair="' + pairIdx + '"]').forEach((s) => s.classList.add('tr-active'));
     tl.container.querySelectorAll('.tr-underline[data-pair="' + pairIdx + '"]').forEach((s) => s.classList.add('tr-active'));
+    tl.container.querySelectorAll('.tr-icon[data-pair="' + pairIdx + '"]').forEach((s) => s.classList.add('tr-icon-active'));
   }
   trActivePair = { pageNum, idx: pairIdx };
   // 定位：锚点片段视口矩形下方居中；不够则上方；再夹在视口内
@@ -3131,17 +3152,18 @@ function trShowPopup(pageNum, pairIdx, anchorEl) {
 function onReaderTrClick(e) {
   const rs = readerState;
   if (!rs || !rs.tr || !rs.tr.enabled) return;
-  const sent = e.target && e.target.closest ? e.target.closest('span.tr-sent') : null;
-  if (!sent) { trHidePopup(); return; }
+  // P2：句尾图标承担点击入口，tr-sent 不再弹译文（绕开 textLayer 选词冲突）
+  const icon = e.target && e.target.closest ? e.target.closest('.tr-icon') : null;
+  if (!icon) { trHidePopup(); return; }
   const sel = window.getSelection();
   if (sel && !sel.isCollapsed) return; // 拖选中，让 M4 接管
   let pageNum = null;
   for (const k in rs.textLayers) {
-    if (rs.textLayers[k].container.contains(sent)) { pageNum = +k; break; }
+    if (rs.textLayers[k].container.contains(icon)) { pageNum = +k; break; }
   }
   if (pageNum == null) return;
-  const pairIdx = +sent.dataset.pair;
-  trShowPopup(pageNum, pairIdx, sent);
+  const pairIdx = +icon.dataset.pair;
+  trShowPopup(pageNum, pairIdx, icon);
 }
 
 
