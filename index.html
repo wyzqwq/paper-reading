@@ -317,6 +317,32 @@
     border-radius: 6px; padding: 8px; font-size: 14px; font-family: inherit; line-height: 1.5;
   }
   .reader-notes-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  /* P2 查词浮层（顶栏下拉，英英 Free Dictionary API） */
+  .reader-dict {
+    position: fixed; right: 12px; top: calc(56px + env(safe-area-inset-top));
+    z-index: 45; width: min(380px, 92vw); max-height: min(70vh, 600px);
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px; box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .reader-dict-search { display: flex; gap: 6px; }
+  .reader-dict-search input {
+    flex: 1; background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px; font-size: 14px; font-family: inherit;
+  }
+  .reader-dict-search button {
+    background: var(--accent); color: #fff; border: none; border-radius: 6px;
+    padding: 8px 12px; cursor: pointer; font-size: 14px;
+  }
+  .reader-dict-results { overflow-y: auto; font-size: 13px; line-height: 1.6; color: var(--text); }
+  .reader-dict-results:empty::before { content: '输入单词查英英释义'; color: var(--muted); }
+  .dict-word { font-size: 18px; font-weight: 600; }
+  .dict-phonetic { color: var(--accent); font-size: 14px; margin-left: 8px; }
+  .dict-audio { cursor: pointer; margin-left: 4px; }
+  .dict-pos { color: var(--muted); font-style: italic; margin-top: 6px; }
+  .dict-def { margin: 2px 0 2px 12px; }
+  .dict-example { color: var(--muted); margin: 0 0 4px 12px; font-size: 12px; }
+  .dict-error, .dict-loading { color: var(--muted); }
   /* 编辑器批注汇总（M4） */
   .anno-list { display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow-y: auto; }
   .anno-item {
@@ -484,6 +510,7 @@
     <button class="reader-translate-btn" id="reader-translate-btn" aria-label="翻译" aria-pressed="false">翻译</button>
     <span class="reader-tr-status" id="reader-tr-status"></span>
     <button class="reader-notes-btn" id="reader-notes-btn" aria-label="笔记">笔记</button>
+    <button class="reader-dict-btn" id="reader-dict-btn" aria-label="查词">查词</button>
   </div>
   <div class="reader-scroll" id="reader-scroll"></div>
   <!-- 选中文字弹出的高亮/批注菜单（M4） -->
@@ -501,6 +528,14 @@
       <button type="button" class="btn-secondary" id="reader-notes-close">收起</button>
       <button type="button" class="btn-primary" id="reader-notes-save">保存</button>
     </div>
+  </div>
+  <!-- P2 查词：顶栏下拉浮层（英英，Free Dictionary API） -->
+  <div class="reader-dict" id="reader-dict" style="display:none">
+    <div class="reader-dict-search">
+      <input type="text" id="reader-dict-input" placeholder="输入单词（英英）…" autocomplete="off" spellcheck="false">
+      <button type="button" id="reader-dict-go">查</button>
+    </div>
+    <div class="reader-dict-results" id="reader-dict-results"></div>
   </div>
   <!-- v2 翻译：点句弹出的 ZH 译文浮层（仅译文） -->
   <div class="reader-tr-popup" id="reader-tr-popup" style="display:none" role="status" aria-live="polite"></div>
@@ -2511,6 +2546,7 @@ function closeReader() {
   }
   hideHlMenu();
   document.getElementById('reader-notes').style.display = 'none';
+  document.getElementById('reader-dict').style.display = 'none';
   document.getElementById('reader').classList.remove('show');
   readerState = null;
   render(); // 刷新列表（read_progress / notes 已写回）
@@ -3454,6 +3490,56 @@ async function deleteHighlight() {
 }
 
 // 阅读器笔记面板（M4）
+// P2 查词面板（英英 Free Dictionary API）
+function toggleReaderDict() {
+  const panel = document.getElementById('reader-dict');
+  if (!panel) return;
+  if (panel.style.display === 'none' || !panel.style.display) {
+    panel.style.display = 'flex';
+    setTimeout(() => { const inp = document.getElementById('reader-dict-input'); if (inp) inp.focus(); }, 0);
+  } else {
+    panel.style.display = 'none';
+  }
+}
+async function doDictLookup() {
+  const inp = document.getElementById('reader-dict-input');
+  const res = document.getElementById('reader-dict-results');
+  if (!inp || !res) return;
+  const word = (inp.value || '').trim().toLowerCase();
+  if (!word) return;
+  res.textContent = '查询中…';
+  try {
+    const r = await fetch('https://api.dictionaryapi.dev/api/v2/entries/en/' + encodeURIComponent(word));
+    if (r.status === 404) { res.innerHTML = '<div class="dict-error">未找到「' + escapeHtml(word) + '」</div>'; return; }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    renderDictResults(word, data);
+  } catch (e) {
+    res.innerHTML = '<div class="dict-error">查询失败：' + escapeHtml(e && e.message ? e.message : String(e)) + '</div>';
+  }
+}
+function renderDictResults(word, data) {
+  const res = document.getElementById('reader-dict-results');
+  if (!Array.isArray(data) || !data.length) { res.innerHTML = '<div class="dict-error">未找到「' + escapeHtml(word) + '」</div>'; return; }
+  const entry = data[0];
+  let html = '<div><span class="dict-word">' + escapeHtml(word) + '</span>';
+  const ph = (entry.phonetics || []).find((p) => p.text);
+  if (ph) html += '<span class="dict-phonetic">' + escapeHtml(ph.text) + '</span>';
+  const au = (entry.phonetics || []).find((p) => p.audio);
+  if (au && au.audio) html += ' <span class="dict-audio" data-audio="' + escapeHtml(au.audio) + '" title="播放发音">🔊</span>';
+  html += '</div>';
+  for (const m of (entry.meanings || [])) {
+    html += '<div class="dict-pos">' + escapeHtml(m.partOfSpeech || '') + '</div>';
+    for (const d of (m.definitions || [])) {
+      html += '<div class="dict-def">' + escapeHtml(d.definition || '') + '</div>';
+      if (d.example) html += '<div class="dict-example">e.g. ' + escapeHtml(d.example) + '</div>';
+    }
+  }
+  res.innerHTML = html;
+  const auEl = res.querySelector('.dict-audio');
+  if (auEl) auEl.addEventListener('click', () => { try { new Audio(auEl.dataset.audio).play(); } catch (e) {} });
+}
+
 function toggleReaderNotes() {
   const rs = readerState;
   if (!rs) return;
@@ -3474,12 +3560,16 @@ async function saveReaderNotes() {
   rs.paper.updated_at = nowISO();
   try { await dbPut(rs.paper); } catch (e) { alert('笔记保存失败：' + (e && e.message ? e.message : e)); }
   document.getElementById('reader-notes').style.display = 'none';
+  document.getElementById('reader-dict').style.display = 'none';
 }
 
 document.getElementById('reader-close').addEventListener('click', closeReader);
 document.getElementById('reader-zoom-in').addEventListener('click', () => readerZoom(1.2));
 document.getElementById('reader-zoom-out').addEventListener('click', () => readerZoom(1 / 1.2));
 document.getElementById('reader-notes-btn').addEventListener('click', toggleReaderNotes);
+document.getElementById('reader-dict-btn').addEventListener('click', toggleReaderDict);
+document.getElementById('reader-dict-go').addEventListener('click', doDictLookup);
+document.getElementById('reader-dict-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') doDictLookup(); });
 document.getElementById('reader-translate-btn').addEventListener('click', () => toggleTranslate());
 document.getElementById('reader-tr-status').addEventListener('click', () => {
   const rs = readerState;
@@ -3491,6 +3581,7 @@ document.getElementById('reader-tr-status').addEventListener('click', () => {
 document.getElementById('reader-scroll').addEventListener('click', onReaderTrClick); // v2：点句弹 ZH
 document.getElementById('reader-notes-close').addEventListener('click', () => {
   document.getElementById('reader-notes').style.display = 'none';
+  document.getElementById('reader-dict').style.display = 'none';
 });
 document.getElementById('reader-notes-save').addEventListener('click', saveReaderNotes);
 document.querySelectorAll('#hl-menu .hl-swatch').forEach((b) => {
