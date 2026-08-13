@@ -548,7 +548,7 @@
 <script>
 // ===== IndexedDB：papers + pdfFiles + annotations（M3 加 pdfFiles，M4 加 annotations；§4.1/§4.2 子集；M6 接 Supabase 同步）=====
 const DB_NAME = 'paper-reading';
-const DB_VERSION = 7; // v7：查词内置英中 -- dict store({word,phonetic,translation}) 预缓存 ECDICT 4.5 万 BNC 词；v6 translations+user_secrets；schemaless 无结构迁移，旧库升级建空 store，syncPull 填充
+const DB_VERSION = 8; // v8：清 dict store 重缓存（af57129 字面\n->真换行，旧 IDB 缓存失效）；v7 dict store 预缓存 ECDICT 4.5 万 BNC 词；v6 translations+user_secrets；schemaless 无结构迁移，旧库升级建空 store，syncPull 填充
 let db = null;
 
 function openDB() {
@@ -609,6 +609,10 @@ function openDB() {
       // v7：查词内置英中 -- dict store 预缓存 ECDICT（{word,phonetic,translation}，keyPath=word）
       if (!d.objectStoreNames.contains('dict')) {
         d.createObjectStore('dict', { keyPath: 'word' });
+      }
+      // v8：清 dict store 重缓存（af57129 dict.json 字面\n->真换行，旧 IDB 缓存需失效）
+      if (e.oldVersion < 8 && d.objectStoreNames.contains('dict')) {
+        e.target.transaction.objectStore('dict').clear();
       }
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
