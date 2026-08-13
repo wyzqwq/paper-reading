@@ -274,6 +274,10 @@
   }
   .textLayer .tr-icon:hover, .textLayer .tr-icon.tr-icon-active { opacity: 1; }
   .textLayer .tr-icon svg { width: 100%; height: 100%; display: block; stroke: var(--accent); fill: none; stroke-width: 1.2; stroke-linejoin: round; }
+  /* 手机触屏：点句弹译文，隐藏句尾小图标（手指难点中 + 冗余），分流见 onReaderTrClick */
+  @media (hover: none) and (pointer: coarse) {
+    .textLayer .tr-icon { display: none; }
+  }
   .reader-tr-popup {
     position: fixed; z-index: 60; max-width: 84vw;
     background: var(--surface-2); color: var(--jade);
@@ -3188,18 +3192,20 @@ function trShowPopup(pageNum, pairIdx, anchorEl) {
 function onReaderTrClick(e) {
   const rs = readerState;
   if (!rs || !rs.tr || !rs.tr.enabled) return;
-  // P2：句尾图标承担点击入口，tr-sent 不再弹译文（绕开 textLayer 选词冲突）
-  const icon = e.target && e.target.closest ? e.target.closest('.tr-icon') : null;
-  if (!icon) { trHidePopup(); return; }
+  // P2：电脑点句尾图标弹译文；手机触屏点 14px 小图标手指难点中，改点 .tr-sent 句片段弹译文。
+  // 手机 tap 点句 vs 长按选词手势本身不同，靠 sel collapsed 守卫区分，冲突比桌面双击-单击轻。
+  const isTouch = matchMedia('(hover: none) and (pointer: coarse)').matches;
+  const el = e.target && e.target.closest ? e.target.closest(isTouch ? '.tr-sent' : '.tr-icon') : null;
+  if (!el) { trHidePopup(); return; }
   const sel = window.getSelection();
   if (sel && !sel.isCollapsed) return; // 拖选中，让 M4 接管
   let pageNum = null;
   for (const k in rs.textLayers) {
-    if (rs.textLayers[k].container.contains(icon)) { pageNum = +k; break; }
+    if (rs.textLayers[k].container.contains(el)) { pageNum = +k; break; }
   }
   if (pageNum == null) return;
-  const pairIdx = +icon.dataset.pair;
-  trShowPopup(pageNum, pairIdx, icon);
+  const pairIdx = +el.dataset.pair;
+  trShowPopup(pageNum, pairIdx, el);
 }
 
 
