@@ -339,7 +339,7 @@
     padding: 8px 12px; cursor: pointer; font-size: 14px;
   }
   .reader-dict-results { overflow-y: auto; font-size: 13px; line-height: 1.6; color: var(--text); }
-  .reader-dict-results:empty::before { content: '输入单词查英英释义'; color: var(--muted); }
+  .reader-dict-results:empty::before { content: '输入单词查中文释义'; color: var(--muted); }
   .dict-word { font-size: 18px; font-weight: 600; }
   .dict-phonetic { color: var(--accent); font-size: 14px; margin-left: 8px; }
   .dict-audio { cursor: pointer; margin-left: 4px; }
@@ -536,7 +536,7 @@
   <!-- P2 查词：顶栏下拉浮层（英英，Free Dictionary API） -->
   <div class="reader-dict" id="reader-dict" style="display:none">
     <div class="reader-dict-search">
-      <input type="text" id="reader-dict-input" placeholder="输入单词（英英）…" autocomplete="off" spellcheck="false">
+      <input type="text" id="reader-dict-input" placeholder="输入单词查中文释义" autocomplete="off" spellcheck="false">
       <button type="button" id="reader-dict-go">查</button>
     </div>
     <div class="reader-dict-results" id="reader-dict-results"></div>
@@ -548,7 +548,7 @@
 <script>
 // ===== IndexedDB：papers + pdfFiles + annotations（M3 加 pdfFiles，M4 加 annotations；§4.1/§4.2 子集；M6 接 Supabase 同步）=====
 const DB_NAME = 'paper-reading';
-const DB_VERSION = 6; // v6：v2 翻译 -- translations(逐页译文缓存)+ user_secrets(DeepSeek key) 两 store；schemaless 无结构迁移，旧库升 v6 时建空 store，syncPull 填充
+const DB_VERSION = 7; // v7：查词内置英中 -- dict store({word,phonetic,translation}) 预缓存 ECDICT 4.5 万 BNC 词；v6 translations+user_secrets；schemaless 无结构迁移，旧库升级建空 store，syncPull 填充
 let db = null;
 
 function openDB() {
@@ -605,6 +605,10 @@ function openDB() {
       }
       if (!d.objectStoreNames.contains('user_secrets')) {
         d.createObjectStore('user_secrets', { keyPath: 'user_id' });
+      }
+      // v7：查词内置英中 -- dict store 预缓存 ECDICT（{word,phonetic,translation}，keyPath=word）
+      if (!d.objectStoreNames.contains('dict')) {
+        d.createObjectStore('dict', { keyPath: 'word' });
       }
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
@@ -3496,7 +3500,59 @@ async function deleteHighlight() {
 }
 
 // 阅读器笔记面板（M4）
-// P2 查词面板（英英 Free Dictionary API）
+
+// ===== 查词：内置英中（ECDICT 4.5 万 BNC 词，预缓存 IndexedDB + 内存 Map）=====
+let dictMap = null;      // Map<word,[phonetic,translation]>，null=未加载
+let dictLoading = null;  // 防重入 Promise
+function idbDictAll() {
+  return new Promise((resolve, reject) => {
+    if (!db) return resolve(null);
+    const os = db.transaction('dict', 'readonly').objectStore('dict');
+    const req = os.getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+function idbDictBulkPut(rows) {
+  return new Promise((resolve, reject) => {
+    if (!db) return resolve();
+    const t = db.transaction('dict', 'readwrite');
+    const os = t.objectStore('dict');
+    for (const r of rows) os.put(r);
+    t.oncomplete = () => resolve();
+    t.onerror = () => reject(t.error);
+  });
+}
+async function dictEnsureLoaded() {
+  if (dictMap) return dictMap;
+  if (dictLoading) return dictLoading;
+  dictLoading = (async () => {
+    // 1. 先查 IndexedDB，命中直接灌 Map（离线/二次打开零网络）
+    const fromIdb = await idbDictAll();
+    if (fromIdb && fromIdb.length) {
+      dictMap = new Map();
+      for (const r of fromIdb) dictMap.set(r.word, [r.phonetic || '', r.translation || '']);
+      return dictMap;
+    }
+    // 2. IDB 空 -> fetch dict.json，存 IDB + 灌 Map
+    dictMap = new Map();
+    const r = await fetch('vendor/ecdict/dict.json');
+    if (!r.ok) throw new Error('dict.json HTTP ' + r.status);
+    const obj = await r.json();
+    const rows = [];
+    for (const w in obj) {
+      const v = obj[w];
+      rows.push({ word: w, phonetic: v[0] || '', translation: v[1] || '' });
+      dictMap.set(w, [v[0] || '', v[1] || '']);
+    }
+    await idbDictBulkPut(rows);
+    return dictMap;
+  })();
+  try { await dictLoading; } finally { dictLoading = null; }
+  return dictMap;
+}
+
+// P2 查词面板（内置英中 ECDICT）
 function toggleReaderDict() {
   const panel = document.getElementById('reader-dict');
   if (!panel) return;
@@ -3515,35 +3571,27 @@ async function doDictLookup() {
   if (!word) return;
   res.textContent = '查询中…';
   try {
-    const r = await fetch('https://api.dictionaryapi.dev/api/v2/entries/en/' + encodeURIComponent(word));
-    if (r.status === 404) { res.innerHTML = '<div class="dict-error">未找到「' + escapeHtml(word) + '」</div>'; return; }
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const data = await r.json();
-    renderDictResults(word, data);
+    await dictEnsureLoaded();
+    const v = dictMap && dictMap.get(word);
+    if (!v || !v[1]) { res.innerHTML = '<div class="dict-error">未找到「' + escapeHtml(word) + '」</div>'; return; }
+    renderDictResults(word, v);
   } catch (e) {
     res.innerHTML = '<div class="dict-error">查询失败：' + escapeHtml(e && e.message ? e.message : String(e)) + '</div>';
   }
 }
-function renderDictResults(word, data) {
+function renderDictResults(word, pair) {
   const res = document.getElementById('reader-dict-results');
-  if (!Array.isArray(data) || !data.length) { res.innerHTML = '<div class="dict-error">未找到「' + escapeHtml(word) + '」</div>'; return; }
-  const entry = data[0];
+  const phonetic = pair[0] || '';
+  const translation = pair[1] || '';
   let html = '<div><span class="dict-word">' + escapeHtml(word) + '</span>';
-  const ph = (entry.phonetics || []).find((p) => p.text);
-  if (ph) html += '<span class="dict-phonetic">' + escapeHtml(ph.text) + '</span>';
-  const au = (entry.phonetics || []).find((p) => p.audio);
-  if (au && au.audio) html += ' <span class="dict-audio" data-audio="' + escapeHtml(au.audio) + '" title="播放发音">🔊</span>';
+  if (phonetic) html += '<span class="dict-phonetic">' + escapeHtml(phonetic) + '</span>';
   html += '</div>';
-  for (const m of (entry.meanings || [])) {
-    html += '<div class="dict-pos">' + escapeHtml(m.partOfSpeech || '') + '</div>';
-    for (const d of (m.definitions || [])) {
-      html += '<div class="dict-def">' + escapeHtml(d.definition || '') + '</div>';
-      if (d.example) html += '<div class="dict-example">e.g. ' + escapeHtml(d.example) + '</div>';
-    }
+  const lines = translation.split('\n');
+  for (const ln of lines) {
+    const s = ln.trim();
+    if (s) html += '<div class="dict-def">' + escapeHtml(s) + '</div>';
   }
   res.innerHTML = html;
-  const auEl = res.querySelector('.dict-audio');
-  if (auEl) auEl.addEventListener('click', () => { try { new Audio(auEl.dataset.audio).play(); } catch (e) {} });
 }
 
 function toggleReaderNotes() {
@@ -3674,6 +3722,7 @@ if ('serviceWorker' in navigator) {
 openDB()
   .then(async () => {
     renderAcct(); render();
+    dictEnsureLoaded().catch((e) => console.warn('dict:', e.message));
     if (sbSession()) syncPull().catch((e) => console.warn('pull:', e.message));
     // SW 更新 reload 后恢复阅读现场（controllerchange 前存了 paper id）
     try {
