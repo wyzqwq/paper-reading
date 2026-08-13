@@ -3531,7 +3531,7 @@ async function dictEnsureLoaded() {
     const fromIdb = await idbDictAll();
     if (fromIdb && fromIdb.length) {
       dictMap = new Map();
-      for (const r of fromIdb) dictMap.set(r.word, [r.phonetic || '', r.translation || '']);
+      for (const r of fromIdb) dictMap.set(r.word.toLowerCase(), [r.phonetic || '', r.translation || '']);
       return dictMap;
     }
     // 2. IDB 空 -> fetch dict.json，存 IDB + 灌 Map
@@ -3543,7 +3543,7 @@ async function dictEnsureLoaded() {
     for (const w in obj) {
       const v = obj[w];
       rows.push({ word: w, phonetic: v[0] || '', translation: v[1] || '' });
-      dictMap.set(w, [v[0] || '', v[1] || '']);
+      dictMap.set(w.toLowerCase(), [v[0] || '', v[1] || '']);
     }
     await idbDictBulkPut(rows);
     return dictMap;
