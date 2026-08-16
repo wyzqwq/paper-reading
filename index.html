@@ -248,7 +248,7 @@
     cursor: default; -webkit-user-select: none; user-select: none;
   }
   .textLayer.selecting .endOfContent {
-    top: 0;
+    top: 0; cursor: text; /* 拖选时 endOfContent 盖满整层，字间/行间空白处光标保持 I-beam 不闪箭头 */
   }
   .textLayer mark.hl {
     color: transparent; border-radius: 1px; padding: 0; cursor: pointer;
