@@ -439,6 +439,7 @@
     <div class="anno-list" id="anno-list"></div>
     <div class="btns">
       <button class="btn-secondary" id="cancel-btn">取消</button>
+      <button class="btn-secondary" id="download-btn" style="display:none">下载 PDF</button>
       <button class="btn-primary" id="save-btn">保存</button>
     </div>
   </div>
@@ -1129,6 +1130,9 @@ function openEditor(p) {
   renderStars();
   updateSourceFields();
   renderAnnoList(p ? p.id : null);
+  // P2 下载 PDF：仅编辑已有条目且可读（local 有文件 / arXiv·URL 有可解析链接）时显示
+  const dlBtn = document.getElementById('download-btn');
+  if (dlBtn) dlBtn.style.display = p && canRead(p) ? '' : 'none';
   document.getElementById('overlay').classList.add('show');
 }
 
@@ -1213,6 +1217,12 @@ document.querySelectorAll('nav.tabs button').forEach((b) => {
 document.getElementById('add-btn').addEventListener('click', () => openEditor(null));
 document.getElementById('cancel-btn').addEventListener('click', closeEditor);
 document.getElementById('save-btn').addEventListener('click', save);
+document.getElementById('download-btn').addEventListener('click', () => {
+  if (!editingPaper) return;
+  // 文件名跟随表单当前标题（用户可能正在改标题未保存）
+  const t = document.getElementById('f-title').value.trim();
+  downloadPaperPdf({ ...editingPaper, title: t || editingPaper.title });
+});
 document.getElementById('overlay').addEventListener('click', (e) => {
   if (e.target.id === 'overlay') closeEditor();
 });
@@ -2162,6 +2172,57 @@ function resolvePdfUrl(p) {
   const m = u.match(/arxiv\.org\/(?:abs|pdf)\/([0-9]{4}\.[0-9]+(?:v[0-9]+)?|[a-z.\-]+\/[0-9]{7}(?:v[0-9]+)?)/i);
   if (m) return 'https://arxiv.org/pdf/' + m[1];
   return u;
+}
+
+// ===== P2 下载 PDF（§11.15）：条目详情页导出到本地 =====
+// 数据源复用 openReader 路径：local 走 IDB pdfFiles（缺失 fallback Storage 下载）；
+// arxiv/url 走 resolvePdfUrl 在线 fetch。
+// 保存分流能力检测（不判 UA）：canShare({files}) 走系统分享面板（iOS 存"文件"/AirDrop/分享），
+// 否则 a[download] 直接下载（Mac/桌面）。用户取消分享（AbortError）静默。
+function pdfFileName(title) {
+  const base = (title || 'paper').replace(/[\/\\:*?"<>|]/g, ' ').trim() || 'paper';
+  return base + '.pdf';
+}
+async function downloadPaperPdf(p) {
+  if (!p) return;
+  try {
+    let blob = null;
+    if (p.source_type === 'local') {
+      let file = await dbGetFile(p.id);
+      if ((!file || !file.data) && sbSession()) {
+        const buf = await sbDownloadPdf(p.id);
+        if (buf) {
+          await dbPutFile({ id: p.id, data: buf, size: buf.byteLength, added_at: nowISO() });
+          file = { id: p.id, data: buf };
+        }
+      }
+      if (!file || !file.data) { toast('本地与云端均无 PDF 文件'); return; }
+      blob = new Blob([file.data], { type: 'application/pdf' });
+    } else {
+      const url = resolvePdfUrl(p);
+      if (!url) { toast('该条目没有可下载的 PDF 链接'); return; }
+      const r = await fetch(url);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      blob = await r.blob();
+      if (!blob || blob.size === 0) throw new Error('空文件');
+    }
+    const name = pdfFileName(p.title);
+    const fileObj = new File([blob], name, { type: 'application/pdf' });
+    if (navigator.canShare && navigator.canShare({ files: [fileObj] })) {
+      await navigator.share({ files: [fileObj] });
+      return;
+    }
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  } catch (e) {
+    if (e && e.name === 'AbortError') return; // 用户取消分享面板
+    toast('下载失败：' + (e && e.message ? e.message : String(e)), 4000);
+  }
 }
 
 async function openReader(paper, jumpPage) {
