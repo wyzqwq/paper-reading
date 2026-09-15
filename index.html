@@ -250,6 +250,8 @@
   .textLayer.selecting .endOfContent {
     top: 0; cursor: text; /* 拖选时 endOfContent 盖满整层，字间/行间空白处光标保持 I-beam 不闪箭头 */
   }
+  /* 拖选中句尾图标不拦截 hit test：Chrome 选区扩展扫过图标时会被截断（选不全/断续），选完松手恢复可点 */
+  .textLayer.selecting .tr-icon { pointer-events: none; }
   .textLayer mark.hl {
     color: transparent; border-radius: 1px; padding: 0; cursor: pointer;
   }
