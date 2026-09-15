@@ -186,6 +186,13 @@
   .reader-page canvas {
     display: block; background: #fff; box-shadow: 0 2px 12px rgba(0,0,0,0.5);
   }
+  /* P2 夜间模式（§11.16）：只反 canvas——invert 反色 + hue-rotate 还原插图色相（不反会全变补色）；
+     textLayer 不加滤镜，高亮批注/选区/译文浮层颜色保持原色。 */
+  .reader-scroll.night .reader-page canvas {
+    background: #000;
+    filter: invert(1) hue-rotate(180deg);
+  }
+  .reader-night-btn[aria-pressed="true"] { background: var(--accent); color: #fff; }
   .reader-loading, .reader-error { color: var(--muted); text-align: center; padding: 40px 20px; font-size: 14px; }
   .reader-error { color: var(--danger); }
   /* textLayer（M4）：透明文字层，盖在 canvas 上让文字可选/可高亮。
@@ -480,6 +487,11 @@
         <div class="hint" id="deepseek-msg"></div>
       </div>
     </div>
+    <div id="night-section" style="border-bottom:1px solid var(--border);padding-bottom:12px;margin-bottom:12px">
+      <label>阅读器夜间模式</label>
+      <div class="hint" id="night-status" style="padding:4px 0">当前：跟随系统</div>
+      <button type="button" class="btn-secondary" id="night-auto" style="padding:8px 14px;font-size:13px">恢复跟随系统</button>
+    </div>
     <label>订阅管理（日推来源）</label>
     <div id="sub-list"></div>
     <button type="button" class="btn-secondary" id="sub-add" style="margin-top:8px;padding:8px 14px;font-size:13px">+ 新增订阅</button>
@@ -518,6 +530,7 @@
     <span class="reader-tr-status" id="reader-tr-status"></span>
     <button class="reader-notes-btn" id="reader-notes-btn" aria-label="笔记">笔记</button>
     <button class="reader-dict-btn" id="reader-dict-btn" aria-label="查词">查词</button>
+    <button class="reader-night-btn" id="reader-night-btn" aria-label="夜间模式" aria-pressed="false">夜间</button>
   </div>
   <div class="reader-scroll" id="reader-scroll"></div>
   <!-- 选中文字弹出的高亮/批注菜单（M4） -->
@@ -3741,6 +3754,43 @@ document.getElementById('reader-zoom-out').addEventListener('click', () => reade
 document.getElementById('reader-notes-btn').addEventListener('click', toggleReaderNotes);
 document.getElementById('reader-dict-btn').addEventListener('click', toggleReaderDict);
 document.getElementById('reader-dict-go').addEventListener('click', doDictLookup);
+
+// P2 阅读器夜间模式（计划书 §11.16，2026-09-16）：默认跟随系统 prefers-color-scheme；
+// 顶栏按钮两态切换（点过存 localStorage 覆盖，不再跟随）；设置页"恢复跟随系统"清除覆盖。
+// 设备级偏好存 localStorage，不同步 Supabase。
+const NIGHT_KEY = 'reader_night'; // 无值=跟随系统；'on'/'off'=手动覆盖
+const nightMq = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+function nightActive() {
+  const pref = localStorage.getItem(NIGHT_KEY);
+  if (pref === 'on') return true;
+  if (pref === 'off') return false;
+  return !!(nightMq && nightMq.matches);
+}
+function applyNight() {
+  const on = nightActive();
+  document.getElementById('reader-scroll').classList.toggle('night', on);
+  document.getElementById('reader-night-btn').setAttribute('aria-pressed', String(on));
+  const st = document.getElementById('night-status');
+  if (st) {
+    const manual = localStorage.getItem(NIGHT_KEY);
+    st.textContent = '当前：' + (manual ? (on ? '夜间（手动开）' : '日间（手动关）') : '跟随系统（现为' + (on ? '夜间' : '日间') + '）');
+  }
+}
+if (nightMq) {
+  // 系统日/夜切换实时响应（仅未手动覆盖时）
+  const onMqChange = () => { if (!localStorage.getItem(NIGHT_KEY)) applyNight(); };
+  if (nightMq.addEventListener) nightMq.addEventListener('change', onMqChange);
+  else if (nightMq.addListener) nightMq.addListener(onMqChange); // 旧 iOS Safari
+}
+document.getElementById('reader-night-btn').addEventListener('click', () => {
+  localStorage.setItem(NIGHT_KEY, nightActive() ? 'off' : 'on');
+  applyNight();
+});
+document.getElementById('night-auto').addEventListener('click', () => {
+  localStorage.removeItem(NIGHT_KEY);
+  applyNight();
+});
+applyNight();
 document.getElementById('reader-dict-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') doDictLookup(); });
 document.getElementById('reader-translate-btn').addEventListener('click', () => toggleTranslate());
 document.getElementById('reader-tr-status').addEventListener('click', () => {
