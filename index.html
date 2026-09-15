@@ -1019,6 +1019,7 @@ function renderCard(p) {
     urlHtml +
     `<div class="actions">` +
       (canRead(p) ? `<button data-act="read">阅读</button>` : '') +
+      (p.source_type !== 'local' && canRead(p) ? `<button data-act="cache">缓存</button>` : '') +
       `<button data-act="edit">编辑</button>` +
       statusActions(p.status) +
       `<button data-act="delete" class="danger">删除</button>` +
@@ -1027,6 +1028,14 @@ function renderCard(p) {
   el.querySelector('[data-act="delete"]').addEventListener('click', () => del(p));
   const readBtn = el.querySelector('[data-act="read"]');
   if (readBtn) readBtn.addEventListener('click', () => openReader(p));
+  // P2 缓存按钮：异步查 pdfFiles 定初始文案（已缓存 = "删除缓存"）
+  const cacheBtn = el.querySelector('[data-act="cache"]');
+  if (cacheBtn) {
+    cacheBtn.addEventListener('click', () => cachePaperPdf(p, cacheBtn));
+    dbGetFile(p.id)
+      .then((f) => { if (f && f.data) { cacheBtn.dataset.cached = '1'; cacheBtn.textContent = '删除缓存'; } })
+      .catch(() => {});
+  }
   el.querySelectorAll('[data-status]').forEach((b) => {
     b.addEventListener('click', () => changeStatus(p, b.dataset.status));
   });
@@ -2227,6 +2236,41 @@ async function downloadPaperPdf(p) {
   }
 }
 
+// P2 手动缓存 PDF（计划书 §3.6，2026-09-14 变更为手动方案）：
+// arXiv/URL 条目 fetch PDF 存 IndexedDB pdfFiles（与本地导入同 store，不上传 Storage，守 §3.7）；
+// openReader 缓存优先（命中离线秒开）。按钮状态机：缓存 -> 缓存中… -> 删除缓存 <-> 缓存。
+async function cachePaperPdf(p, btn) {
+  if (!p || !btn || btn.disabled) return;
+  if (btn.dataset.cached === '1') {
+    btn.disabled = true;
+    try {
+      await dbDeleteFile(p.id);
+      btn.dataset.cached = '0';
+      btn.textContent = '缓存';
+      toast('已删除本地缓存');
+    } catch (e) {
+      toast('删除缓存失败：' + (e && e.message ? e.message : String(e)));
+    } finally { btn.disabled = false; }
+    return;
+  }
+  const url = resolvePdfUrl(p);
+  if (!url) { toast('该条目没有可缓存的 PDF 链接'); return; }
+  btn.disabled = true; btn.textContent = '缓存中…';
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const buf = await r.arrayBuffer();
+    if (!buf || buf.byteLength === 0) throw new Error('空文件');
+    await dbPutFile({ id: p.id, data: buf, size: buf.byteLength, added_at: nowISO() });
+    btn.dataset.cached = '1';
+    btn.textContent = '删除缓存';
+    toast('已缓存到本地（' + (buf.byteLength / 1048576).toFixed(1) + ' MB）');
+  } catch (e) {
+    toast('缓存失败：' + (e && e.message ? e.message : String(e)), 4000);
+    btn.textContent = '缓存';
+  } finally { btn.disabled = false; }
+}
+
 async function openReader(paper, jumpPage) {
   // 决定加载源：local 走 IndexedDB 二进制（dbGetFile）；arXiv/url 走 resolvePdfUrl（abs 归一化为 pdf）
   let url = null;
@@ -2249,9 +2293,16 @@ async function openReader(paper, jumpPage) {
       return;
     }
   } else {
-    url = resolvePdfUrl(paper);
-    if (!url) { alert('该条目没有可加载的 PDF 链接。'); return; }
-    docInit = { url };
+    // P2 缓存优先：手动缓存过（pdfFiles 命中）直接本地读（离线可读、秒开），未命中在线加载
+    let cached = null;
+    try { cached = await dbGetFile(paper.id); } catch (e) { /* 查不到当未缓存 */ }
+    if (cached && cached.data) {
+      docInit = { data: cached.data };
+    } else {
+      url = resolvePdfUrl(paper);
+      if (!url) { alert('该条目没有可加载的 PDF 链接。'); return; }
+      docInit = { url };
+    }
   }
   const overlay = document.getElementById('reader');
   overlay.classList.add('show');
