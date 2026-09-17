@@ -299,6 +299,12 @@
   .reader-tr-popup .katex { font-size: 1.08em; }
   .reader-tr-popup .tr-math-block { margin: 6px 0; text-align: center; overflow-x: auto; }
   .reader-tr-popup .tr-math-inline { white-space: normal; }
+  /* v2.1.2 弹层导航条：‹ i/N › 连续切句（手机 28px 触控目标） */
+  .reader-tr-popup .reader-tr-nav { display: flex; align-items: center; gap: 4px; margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--border); }
+  .reader-tr-popup .tr-nav-btn { min-width: 28px; height: 28px; padding: 0 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2); color: var(--jade); font-size: 15px; line-height: 1; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  .reader-tr-popup .tr-nav-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .reader-tr-popup .tr-nav-btn:disabled { opacity: .3; cursor: default; }
+  .reader-tr-popup .tr-nav-pos { font-size: 12px; color: var(--muted); min-width: 52px; text-align: center; font-variant-numeric: tabular-nums; }
   .reader-translate-btn[aria-pressed="true"] { background: var(--accent); color: #fff; }
   .reader-tr-status {
     color: var(--muted); font-size: 12px; min-width: 0; flex-shrink: 1;
@@ -484,6 +490,7 @@
       <div id="translate-loggedin" style="display:none">
         <input id="deepseek-key" type="password" placeholder="sk-...（DeepSeek API key）" autocomplete="off" style="margin-top:6px">
         <div class="hint" style="margin-top:4px">key 存 Supabase（user_secrets 表，仅自己可读），经 Edge Function 代理转发 DeepSeek；不进前端持久状态、不进 git，跨设备同步。</div>
+        <div class="hint" style="margin-top:4px">阅读时：点句尾小图标（手机点句子）看该句译文；弹层内点 ‹ › 或按 ←/→ 键连续切换。</div>
         <div class="btns" style="margin-top:8px">
           <button class="btn-primary" id="deepseek-save">保存</button>
           <button class="btn-secondary" id="deepseek-show" style="font-size:13px;padding:8px 14px">显示</button>
@@ -562,7 +569,14 @@
     <div class="reader-dict-results" id="reader-dict-results"></div>
   </div>
   <!-- v2 翻译：点句弹出的 ZH 译文浮层（仅译文） -->
-  <div class="reader-tr-popup" id="reader-tr-popup" style="display:none" role="status" aria-live="polite"></div>
+  <div class="reader-tr-popup" id="reader-tr-popup" style="display:none" role="status" aria-live="polite">
+    <div id="reader-tr-pop-body"></div>
+    <div class="reader-tr-nav" id="reader-tr-pop-nav" style="display:none">
+      <button type="button" class="tr-nav-btn" id="tr-nav-prev" aria-label="上一句">‹</button>
+      <span class="tr-nav-pos" id="tr-nav-pos"></span>
+      <button type="button" class="tr-nav-btn" id="tr-nav-next" aria-label="下一句">›</button>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -3276,17 +3290,18 @@ function trPaintUnderlines(pageEl) {
   for (const [k, rects] of groups) {
     if (!rects.length) continue;
     rects.sort((a, b) => a.y - b.y || a.x - b.x);
+    // v2.1.2 行分组改「垂直区间重叠」：下标/上标 y 偏移但区间与正文行交叠 -> 并进同一行（单条下划线），
+    // 治「公式下标句画两条线」；相邻正文行区间不交叠，不会误并。行几何用 y/bottom 精确合并。
     const rows = [];
     for (const r of rects) {
-      const last = rows[rows.length - 1];
-      if (last && Math.abs(r.y - last.y) < 3) {
-        last.segs.push(r);
-        last.minX = Math.min(last.minX, r.x);
-        last.maxEnd = Math.max(last.maxEnd, r.x + r.w);
-        last.y = Math.min(last.y, r.y);
-        last.h = Math.max(last.h, r.h);
+      const hit = rows.find((row) => r.y < row.bottom - 1 && r.y + r.h > row.y + 1);
+      if (hit) {
+        hit.minX = Math.min(hit.minX, r.x);
+        hit.maxEnd = Math.max(hit.maxEnd, r.x + r.w);
+        hit.y = Math.min(hit.y, r.y);
+        hit.bottom = Math.max(hit.bottom, r.y + r.h);
       } else {
-        rows.push({ y: r.y, h: r.h, minX: r.x, maxEnd: r.x + r.w, segs: [r] });
+        rows.push({ y: r.y, bottom: r.y + r.h, minX: r.x, maxEnd: r.x + r.w });
       }
     }
     for (const row of rows) {
@@ -3294,18 +3309,19 @@ function trPaintUnderlines(pageEl) {
       ul.className = 'tr-underline';
       ul.dataset.pair = k;
       ul.style.left = row.minX + 'px';
-      ul.style.top = (row.y + row.h - 1) + 'px';
+      ul.style.top = (row.bottom - 1) + 'px';
       ul.style.width = (row.maxEnd - row.minX) + 'px';
       layer.appendChild(ul);
     }
-    // P2：句尾图标 -- 末行右端外侧放书页角小图标，单击弹该句译文（绕开 textLayer 选词冲突）
+    // P2：句尾图标 -- 末行（y 最大 = 视觉最后一行）右端放书页角小图标，单击弹该句译文。
+    // v2.1.2：left 由 maxEnd+2 改 maxEnd-4（贴住标点，不再悬空）；下标已并进末行，中心不会掉到下标位置。
     const lastRow = rows[rows.length - 1];
     const icon = document.createElement('div');
     icon.className = 'tr-icon';
     icon.dataset.pair = k;
     icon.title = '查看译文';
-    icon.style.left = (lastRow.maxEnd + 2) + 'px';
-    icon.style.top = (lastRow.y + lastRow.h / 2 - 7) + 'px';
+    icon.style.left = (lastRow.maxEnd - 4) + 'px';
+    icon.style.top = (lastRow.y + (lastRow.bottom - lastRow.y) / 2 - 7) + 'px';
     icon.innerHTML = '<svg viewBox="0 0 14 14"><path d="M3 2 H9 L11 4 V12 H3 Z"/><path d="M9 2 V4 H11"/></svg>';
     layer.appendChild(icon);
   }
@@ -3363,8 +3379,8 @@ function trLoadKatex() {
 // 弹层内容渲染：zh 按 $$...$$（优先）/$...$ 拆段——文本段 textContent（安全，zh 是 LLM 输出不得 innerHTML），
 // 公式段 katex.renderToString（throwOnError:false，解析失败 KaTeX 自身显示红色源码不抛）。
 // KaTeX 不可用时公式段按原文显示。
-async function trRenderPopupContent(pop, zh) {
-  pop.textContent = '';
+async function trRenderPopupContent(body, zh) {
+  body.textContent = '';
   const parts = [];
   const re = /\$\$([\s\S]+?)\$\$|\$([^$\n]+?)\$/g;
   let last = 0, m;
@@ -3379,13 +3395,13 @@ async function trRenderPopupContent(pop, zh) {
     try { katex = await trLoadKatex(); } catch (e) { katex = null; }
   }
   for (const p of parts) {
-    if (p.text != null) { pop.appendChild(document.createTextNode(p.text)); continue; }
-    if (!katex) { pop.appendChild(document.createTextNode(p.display ? '$$' + p.tex + '$$' : '$' + p.tex + '$')); continue; }
+    if (p.text != null) { body.appendChild(document.createTextNode(p.text)); continue; }
+    if (!katex) { body.appendChild(document.createTextNode(p.display ? '$$' + p.tex + '$$' : '$' + p.tex + '$')); continue; }
     const span = document.createElement(p.display ? 'div' : 'span');
     span.className = p.display ? 'tr-math-block' : 'tr-math-inline';
     try { span.innerHTML = katex.renderToString(p.tex, { throwOnError: false, displayMode: p.display }); }
     catch (e) { span.textContent = p.tex; }
-    pop.appendChild(span);
+    body.appendChild(span);
   }
 }
 
@@ -3397,12 +3413,25 @@ function trShowPopup(pageNum, pairIdx, anchorEl) {
   if (!pg || !pg.pairs || !pg.pairs[pairIdx]) return;
   const zh = pg.pairs[pairIdx].zh || '';
   const pop = document.getElementById('reader-tr-popup');
-  if (!pop) return;
+  const body = document.getElementById('reader-tr-pop-body');
+  if (!pop || !body) return;
   trHidePopup(); // 清上一处
   const seq = ++trPopupSeq;
-  trRenderPopupContent(pop, zh).then(() => {
+  trRenderPopupContent(body, zh).then(() => {
     if (seq !== trPopupSeq) return; // 期间已被新弹层取代
     pop.style.display = 'block';
+    // v2.1.2 导航条：i/N + 页首/页尾置灰（页内连续切句）
+    const nav = document.getElementById('reader-tr-pop-nav');
+    if (nav) {
+      nav.style.display = 'flex';
+      document.getElementById('tr-nav-pos').textContent = (pairIdx + 1) + ' / ' + pg.pairs.length;
+      document.getElementById('tr-nav-prev').disabled = pairIdx <= 0;
+      document.getElementById('tr-nav-next').disabled = pairIdx >= pg.pairs.length - 1;
+    }
+    if (!localStorage.getItem('tr_nav_hint')) { // 首用提示，只弹一次
+      localStorage.setItem('tr_nav_hint', '1');
+      try { toast('点 ‹ › 或按 ←/→ 可连续查看译文', 3500); } catch (e) {}
+    }
     const tl = rs.textLayers && rs.textLayers[pageNum];
     if (tl) {
       tl.container.querySelectorAll('span.tr-sent[data-pair="' + pairIdx + '"]').forEach((s) => s.classList.add('tr-active'));
@@ -3422,6 +3451,39 @@ function trShowPopup(pageNum, pairIdx, anchorEl) {
     pop.style.top = Math.round(top) + 'px';
   });
 }
+
+// v2.1.2 弹层导航：页内连续切句。跳过没有 DOM 锚点的句（匹配失败没包裹的 pair），箭头不至于点死。
+function trNavTo(dir) {
+  if (!trActivePair) return;
+  const rs = readerState;
+  const pg = rs && rs.tr && rs.tr.pages[trActivePair.pageNum];
+  const tl = rs && rs.textLayers && rs.textLayers[trActivePair.pageNum];
+  if (!pg || !pg.pairs || !tl) return;
+  let idx = trActivePair.idx + dir;
+  while (idx >= 0 && idx < pg.pairs.length) {
+    const el = tl.container.querySelector('span.tr-sent[data-pair="' + idx + '"]') ||
+               tl.container.querySelector('.tr-icon[data-pair="' + idx + '"]');
+    if (el) { // 目标句不在视口时先滚到中间再定位弹层
+      el.scrollIntoView({ block: 'center' });
+      trShowPopup(trActivePair.pageNum, idx, el);
+      return;
+    }
+    idx += dir;
+  }
+}
+
+document.getElementById('tr-nav-prev').addEventListener('click', () => trNavTo(-1));
+document.getElementById('tr-nav-next').addEventListener('click', () => trNavTo(1));
+// 键盘 ←/→ 切句、Esc 关弹层：仅弹层显示时接管；输入框/可编辑区聚焦时让路
+document.addEventListener('keydown', (e) => {
+  const pop = document.getElementById('reader-tr-popup');
+  if (!pop || pop.style.display === 'none' || !trActivePair) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+  if (e.key === 'ArrowLeft') { e.preventDefault(); trNavTo(-1); }
+  else if (e.key === 'ArrowRight') { e.preventDefault(); trNavTo(1); }
+  else if (e.key === 'Escape') trHidePopup();
+});
 
 // 点句弹 ZH 浮层（事件委托）；选区展开时让位 M4 高亮菜单
 function onReaderTrClick(e) {
