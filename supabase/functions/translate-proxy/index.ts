@@ -8,15 +8,20 @@
 // 本函数用调用者 JWT 查自己的 key(非 service role key,见计划书 §11.3),再转发 DeepSeek。
 //
 // verify_jwt=true（见 supabase/config.toml）：Supabase 网关验过 JWT 才放行到本函数。
-// 调用：POST .../translate-proxy   Body: {"text":"<页 textLayer 全文>"}   带 Authorization: Bearer <JWT>
-// 返回：{"sentences":[{"en":"原句verbatim","zh":"译文"},...]}
+// 调用：POST .../translate-proxy   Body: {"text":"<页 textLayer 全文>","image":"data:image/jpeg;base64,<页图,数学页可选>"}
+//   带 Authorization: Bearer <JWT>
+// 返回：{"sentences":[{"en":"原句verbatim","zh":"译文(公式为 $...$/$$...$$ LaTeX)"},...]}
 //   错误：{"error":"..."} 配 400/401/429/502。
 //
-// DeepSeek API（2026-08-06 核对 api-docs.deepseek.com）：
+// DeepSeek API（2026-09-17 核对 api-docs.deepseek.com）：
 //   base https://api.deepseek.com  endpoint /chat/completions  OpenAI 兼容
-//   模型 deepseek-v4-flash(快/便宜,非推理)/ deepseek-v4-pro(重,带 thinking)
-//   response_format {type:"json_object"} 支持；thinking/reasoning_effort 可选(翻译不开启,要快)
-//   返回 choices[0].message.content(标准 OpenAI)；旧 deepseek-chat 已下线改 v4-*。
+//   模型 deepseek-flash(快/便宜档;支持 vision 读图;旧名 deepseek-v4-flash/-vision-exp 别名兼容)/
+//        deepseek-v4-pro(重,vision 不支持)
+//   response_format {type:"json_object"} 支持
+//   V4.1-Flash thinking 默认开启(默认 effort=high)——必须显式 {"thinking":{"type":"disabled"}},
+//   否则翻译跑推理模式,慢 + thinking token 按 output 计费(504 风险也变大)。
+//   图片: user 消息 content 数组加 {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}},
+//   服务端统一缩到 ~1300×1300、每图 ≤1024 token;system 消息里放图会 400。
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -26,8 +31,9 @@ const CORS = {
 };
 
 const DEEPSEEK_URL = 'https://api.deepseek.com/chat/completions';
-const DEEPSEEK_MODEL = 'deepseek-v4-flash'; // 快/便宜档,翻译够用;非推理(不带 thinking)
+const DEEPSEEK_MODEL = 'deepseek-flash'; // 快/便宜档,翻译够用;支持 vision(公式读图)
 const MAX_TEXT = 20000; // 单页 textLayer 文本上限,防单次调用过大/超 token
+const MAX_IMAGE_BYTES = 2 * 1024 * 1024; // 请求里 image(base64 JPEG 页图)上限,防 body 过大
 const TEMPERATURE = 0.3; // 译文稳定,低温度
 
 const SYSTEM_PROMPT = [
@@ -37,10 +43,11 @@ const SYSTEM_PROMPT = [
   '1. 输出 JSON 对象,格式 {"sentences":[{"en":"<原句英文 verbatim>","zh":"<中文译文>"},...]}。',
   '2. "en" 必须是原文逐字拷贝(verbatim),包括 "Fig. 3"、"et al."、引号等,不得改写、不得合并、不得拆分;前端按文本偏移定位,改写会匹配失败。',
   '3. 切句以句子语义边界为准(句号/问号/叹号/分号),不要按 "Fig."/"et al." 这类缩写误切。',
-  '4. 数学公式、变量符号(如 x²、α、∇)、代码、URL、参考文献编号 原样保留不译,只译周围文字。',
+  '4. 数学公式、变量符号(如 x²、α、∇)、代码、URL、参考文献编号 不翻译,只译周围文字。',
   '5. 已是中文的片段跳过不译,en 照抄、zh 留原样或空。',
   '6. 句子间顺序与原文一致;不要增删句子;不要加任何解释/前言/后语,只输出 JSON。',
   '7. 用户消息可能含 <page>本页文本</page> + <ctx_prev>上一页末尾</ctx_prev> / <ctx_next>下一页开头</ctx_next> 上下文。只翻译 <page> 内的文本(它才是当前页),<ctx_*> 仅供理解跨页句语义,不译、不出现在 sentences 里。本页首尾可能是不完整句(跨页切断),照常译,译文可与上下文衔接。',
+  '8. 用户消息可能附一张图:该页 PDF 的原始渲染图像。文本来自 PDF 文字层,数学公式的字形映射可能错乱(如 ∫ 提取成 ~、ζ 提取成 Z、+ 提取成 4-),上下标也可能乱序。有图时公式一律以图像为准:在 zh 里把公式重建为正确的 LaTeX,行内公式用 $...$ 包裹、独立公式用 $$...$$ 包裹;务必保持符号、上下标、希腊字母与图中一致。无图时按上下文语义尽力重建。en 仍逐字拷贝文字层原文(不得按图改写,定位依赖它)。',
 ].join('\n');
 
 function json(status: number, body: unknown) {
@@ -80,18 +87,28 @@ Deno.serve(async (req: Request) => {
   }
   if (!deepseekKey) return json(400, { error: '未设置 DeepSeek key,请到设置页填写' });
 
-  // 2. 读请求体文本
+  // 2. 读请求体文本 + 可选页图(数学页前端传 base64 JPEG,公式以图为准)
   let text = '';
+  let image = ''; // data:image/jpeg;base64,... 或空
   try {
     const body = await req.json();
     text = typeof body?.text === 'string' ? body.text : '';
+    image = typeof body?.image === 'string' ? body.image : '';
   } catch {
     text = '';
   }
   if (!text) return json(400, { error: '缺少 text' });
   if (text.length > MAX_TEXT) text = text.slice(0, MAX_TEXT);
+  if (image && image.length > MAX_IMAGE_BYTES) image = ''; // 超大图降级纯文本,不炸请求
 
-  // 3. 调 DeepSeek,JSON 模式逐句翻译(不开 thinking,要快/省)
+  // 3. 调 DeepSeek,JSON 模式逐句翻译(显式关 thinking:V4.1-Flash 默认开,不关会慢/贵)
+  //    有图时 user 消息用 content 数组(文本+image_url);无图保持纯字符串,行为同旧版
+  const userContent: string | Array<Record<string, unknown>> = image
+    ? [
+        { type: 'text', text },
+        { type: 'image_url', image_url: { url: image } },
+      ]
+    : text;
   let dsRes: Response;
   try {
     dsRes = await fetch(DEEPSEEK_URL, {
@@ -104,11 +121,12 @@ Deno.serve(async (req: Request) => {
         model: DEEPSEEK_MODEL,
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: text },
+          { role: 'user', content: userContent },
         ],
         response_format: { type: 'json_object' },
         stream: false,
         temperature: TEMPERATURE,
+        thinking: { type: 'disabled' },
       }),
     });
   } catch (e) {

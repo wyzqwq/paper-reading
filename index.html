@@ -295,6 +295,10 @@
     box-shadow: 0 6px 20px rgba(0,0,0,0.5);
     -webkit-tap-highlight-color: transparent;
   }
+  /* v2.1 弹层公式：KaTeX 字号随弹层，独立公式块居中留白；KaTeX 主字体继承弹层前景色 */
+  .reader-tr-popup .katex { font-size: 1.08em; }
+  .reader-tr-popup .tr-math-block { margin: 6px 0; text-align: center; overflow-x: auto; }
+  .reader-tr-popup .tr-math-inline { white-space: normal; }
   .reader-translate-btn[aria-pressed="true"] { background: var(--accent); color: #fff; }
   .reader-tr-status {
     color: var(--muted); font-size: 12px; min-width: 0; flex-shrink: 1;
@@ -2725,7 +2729,7 @@ function toast(msg, ms) {
 
 // 缓存版本：拼进 source_hash（sha256(TR_CACHE_VERSION + text)）。空串=初始版，与既有缓存 sha256(text) 兼容；
 // 改 Edge Function 的 SYSTEM_PROMPT / DEEPSEEK_MODEL 时同步 bump（'v2'/'v3'...），旧缓存 hash 不符自动失效重译。
-const TR_CACHE_VERSION = 'ctx1'; // bump: 加跨页上下文 <ctx_*> + 分块翻译，旧缓存 hash 不符自动失效重译
+const TR_CACHE_VERSION = 'img1'; // bump: 数学页读图通道（页图传 DeepSeek 以图重建公式 LaTeX）+ prompt 规则8，旧缓存 hash 不符自动失效重译
 
 // 分块上限：2000 时 body 含 ctx 标记可达 2100+，偶发 546（p3 chunk1 2132 失败/p2 2118 成功，DeepSeek 响应波动），1500 更稳
 const TR_CHUNK_SIZE = 1500;
@@ -2793,6 +2797,50 @@ async function trExtractPageText(pageNum) {
   return s;
 }
 
+// ---- v2.1 数学页读图通道 ----
+// 背景：textLayer 提取的公式是乱序+字形映射错乱的字符流（∫→~、ζ→Z、+→4-），提取侧无真值可恢复；
+// 真值只在渲染像素里。数学页把页图（离屏渲染 JPEG）随文本一起传 DeepSeek（deepseek-flash 支持读图），
+// prompt 指示公式以图为准重建为 LaTeX。图片经 DeepSeek 统一缩至 ~1300×1300、每张 ≤1024 token，
+// 成本约 ¥0.002/页，忽略不计，故不做开关、仅数学页（启发式命中）走此通道，纯文字页零变化。
+
+// 数学页启发式：含特殊数学符号，或 ≥2 行含 '='（公式行特征；普通散文极少出现）
+function trIsMathPage(text) {
+  if (!text) return false;
+  if (/[∂∑∇∫≈′ℓξζΠΣ]/.test(text)) return true;
+  let eq = 0;
+  for (const l of text.split('\n')) {
+    if (l.includes('=') && l.trim().length > 2 && ++eq >= 2) return true;
+  }
+  return false;
+}
+
+// 离屏渲染页图：宽 ~1300px（与 DeepSeek 服务端缩放档一致），白底 JPEG 0.82 → data URL。
+// 独立于阅读器当前缩放/夜间模式（拿原始像素，非反色 CSS 效果），输出确定性；用完立即释放。
+async function trRenderPageImage(pageNum) {
+  const rs = readerState;
+  if (!rs || !rs.pdf) return '';
+  try {
+    const page = await rs.pdf.getPage(pageNum);
+    const vp0 = page.getViewport({ scale: 1 });
+    const scale = Math.min(2, Math.max(1, 1300 / vp0.width));
+    const vp = page.getViewport({ scale });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.ceil(vp.width);
+    canvas.height = Math.ceil(vp.height);
+    const ctx = canvas.getContext('2d', { alpha: false });
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    const url = canvas.toDataURL('image/jpeg', 0.82);
+    canvas.width = canvas.height = 0; // 释放显存
+    console.log('[tr] p' + pageNum, '页图 ' + (url.length / 1024).toFixed(0) + 'KB(base64)');
+    return url;
+  } catch (e) {
+    console.log('[tr] p' + pageNum, '页图渲染失败，降级纯文本', (e && e.message) || e);
+    return '';
+  }
+}
+
 // SHA-256 hex（crypto.subtle，需 secure context；GitHub Pages HTTPS / localhost 均可）
 async function sha256Hex(text) {
   const buf = new TextEncoder().encode(text);
@@ -2800,16 +2848,17 @@ async function sha256Hex(text) {
   return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-// 单次调 translate-proxy（带 JWT；sbFetch 自动 401 刷新）。text 可含 <ctx_*> 上下文标记
+// 单次调 translate-proxy（带 JWT；sbFetch 自动 401 刷新）。payload = { text, image? }，
+// image 为数学页的 base64 页图（data:image/jpeg），只在首个 chunk 附带（同页多 chunk 不重复传图）。
 // 504/546/502（DeepSeek 偶发慢导致网关超时，非长度）递增 backoff 重试 3 次（2s/4s/6s，等 DeepSeek 恢复）；
 // 其他错误（401/400/429）不重试直接抛
-async function trCallProxySingle(text) {
+async function trCallProxySingle(payload) {
   const s = sbSession();
   if (!s) throw new Error('未登录');
   const headers = sbHeaders(s.access_token);
   headers['Content-Type'] = 'application/json';
   const url = SUPABASE_URL + '/functions/v1/translate-proxy';
-  const body = JSON.stringify({ text });
+  const body = JSON.stringify(payload);
   let lastErr = null;
   for (let attempt = 0; attempt < 4; attempt++) { // 首调 + 3 retry
     const rs = readerState;
@@ -2841,10 +2890,12 @@ async function trCallProxySingle(text) {
 }
 
 // 翻译整页文本：分块（避超时 504）+ 跨页上下文（首块带 prevCtx、末块带 nextCtx，<ctx_*> 标记供 Edge Function 识别只译 <page>）
+// 数学页 opts.image（页图 data URL）只附在首块
 async function trCallProxy(text, opts) {
   const rs = readerState;
   const prevCtx = opts && opts.prevCtx;
   const nextCtx = opts && opts.nextCtx;
+  const image = (opts && opts.image) || '';
   const chunks = trSplitText(text, TR_CHUNK_SIZE);
   if (chunks.length === 0) return [];
   const all = [];
@@ -2853,9 +2904,9 @@ async function trCallProxy(text, opts) {
     let body = chunks[i];
     if (i === 0 && prevCtx) body = '<ctx_prev>' + prevCtx + '</ctx_prev>\n' + body;
     if (i === chunks.length - 1 && nextCtx) body += '\n<ctx_next>' + nextCtx + '</ctx_next>';
-    console.log('[tr] chunk ' + (i + 1) + '/' + chunks.length, 'len=' + body.length);
+    console.log('[tr] chunk ' + (i + 1) + '/' + chunks.length, 'len=' + body.length, i === 0 && image ? '+img' : '');
     let pairs;
-    try { pairs = await trCallProxySingle(body); }
+    try { pairs = await trCallProxySingle(i === 0 ? { text: body, image } : { text: body }); }
     catch (e) { console.log('[tr] chunk ' + (i + 1) + ' 失败:', e.message); throw e; }
     if (Array.isArray(pairs)) all.push(...pairs);
   }
@@ -2922,7 +2973,8 @@ async function trEnsurePairs(pageNum) {
   // 跨页上下文：前页末尾 + 后页开头，让 DeepSeek 理解跨页句（只译本页 <page>，ctx 不译）
   const prevCtx = pageNum > 1 ? await trGetCtx(pageNum - 1, 'tail') : '';
   const nextCtx = pageNum < rs.numPages ? await trGetCtx(pageNum + 1, 'head') : '';
-  const pairs = await trCallProxy(text, { prevCtx, nextCtx });
+  const image = trIsMathPage(text) ? await trRenderPageImage(pageNum) : '';
+  const pairs = await trCallProxy(text, { prevCtx, nextCtx, image });
   console.log('[tr] p' + pageNum, '代理返回 pairs=' + (pairs ? pairs.length : 'null'));
   if (!rs.tr || rs.tr.cancelled) return null; // 调用期间被取消
   await dbPutTranslation({ id: (cached && cached.id) || uid(), user_id: userId, paper_id: paperId, page_num: pageNum, pairs, source_hash: hash });
@@ -2948,7 +3000,8 @@ async function trRetranslatePage(pageNum) {
   if (text.trim()) {
     const prevCtx = pageNum > 1 ? await trGetCtx(pageNum - 1, 'tail') : '';
     const nextCtx = pageNum < rs.numPages ? await trGetCtx(pageNum + 1, 'head') : '';
-    try { pairs = await trCallProxy(text, { prevCtx, nextCtx }); }
+    const image = trIsMathPage(text) ? await trRenderPageImage(pageNum) : '';
+    try { pairs = await trCallProxy(text, { prevCtx, nextCtx, image }); }
     catch (e) { trApplyError('重译失败：' + ((e && e.message) || e)); tr.pages[pageNum].status = 'error'; trRenderStatus(); return; }
     if (!rs.tr || rs.tr.cancelled) return;
   }
@@ -3293,6 +3346,59 @@ function trHidePopup() {
   }
   trActivePair = null;
 }
+// ---- KaTeX 懒加载（v2.1 公式渲染）----
+// 译文 zh 里公式段为 $...$（行内）/ $$...$$（独立）。首次遇到含公式的译文才加载 vendor/katex
+// （本地 vendor，守 §5 不碰 CDN；约 300KB JS+CSS，字体按需）。Promise 缓存防重复加载；
+// 加载失败（离线首用等）回退显示原始 $...$ 文本，不炸流程。
+let katexLoadPromise = null;
+function trLoadKatex() {
+  if (window.katex) return Promise.resolve(window.katex);
+  if (!katexLoadPromise) {
+    katexLoadPromise = new Promise((resolve, reject) => {
+      const css = document.createElement('link');
+      css.rel = 'stylesheet';
+      css.href = './vendor/katex/katex.min.css';
+      document.head.appendChild(css);
+      const s = document.createElement('script');
+      s.src = './vendor/katex/katex.min.js';
+      s.onload = () => resolve(window.katex);
+      s.onerror = () => { katexLoadPromise = null; css.remove(); reject(new Error('KaTeX 加载失败')); };
+      document.head.appendChild(s);
+    });
+  }
+  return katexLoadPromise;
+}
+
+// 弹层内容渲染：zh 按 $$...$$（优先）/$...$ 拆段——文本段 textContent（安全，zh 是 LLM 输出不得 innerHTML），
+// 公式段 katex.renderToString（throwOnError:false，解析失败 KaTeX 自身显示红色源码不抛）。
+// KaTeX 不可用时公式段按原文显示。
+async function trRenderPopupContent(pop, zh) {
+  pop.textContent = '';
+  const parts = [];
+  const re = /\$\$([\s\S]+?)\$\$|\$([^$\n]+?)\$/g;
+  let last = 0, m;
+  while ((m = re.exec(zh))) {
+    if (m.index > last) parts.push({ text: zh.slice(last, m.index) });
+    parts.push(m[1] !== undefined ? { tex: m[1], display: true } : { tex: m[2], display: false });
+    last = re.lastIndex;
+  }
+  if (last < zh.length) parts.push({ text: zh.slice(last) });
+  let katex = null;
+  if (parts.some((p) => p.tex != null)) {
+    try { katex = await trLoadKatex(); } catch (e) { katex = null; }
+  }
+  for (const p of parts) {
+    if (p.text != null) { pop.appendChild(document.createTextNode(p.text)); continue; }
+    if (!katex) { pop.appendChild(document.createTextNode(p.display ? '$$' + p.tex + '$$' : '$' + p.tex + '$')); continue; }
+    const span = document.createElement(p.display ? 'div' : 'span');
+    span.className = p.display ? 'tr-math-block' : 'tr-math-inline';
+    try { span.innerHTML = katex.renderToString(p.tex, { throwOnError: false, displayMode: p.display }); }
+    catch (e) { span.textContent = p.tex; }
+    pop.appendChild(span);
+  }
+}
+
+let trPopupSeq = 0; // 弹层序号：KaTeX 懒加载是异步的，防旧弹层 await 回来后覆盖新弹层
 function trShowPopup(pageNum, pairIdx, anchorEl) {
   const rs = readerState;
   if (!rs || !rs.tr) return;
@@ -3302,25 +3408,28 @@ function trShowPopup(pageNum, pairIdx, anchorEl) {
   const pop = document.getElementById('reader-tr-popup');
   if (!pop) return;
   trHidePopup(); // 清上一处
-  pop.textContent = zh;
-  pop.style.display = 'block';
-  const tl = rs.textLayers && rs.textLayers[pageNum];
-  if (tl) {
-    tl.container.querySelectorAll('span.tr-sent[data-pair="' + pairIdx + '"]').forEach((s) => s.classList.add('tr-active'));
-    tl.container.querySelectorAll('.tr-underline[data-pair="' + pairIdx + '"]').forEach((s) => s.classList.add('tr-active'));
-    tl.container.querySelectorAll('.tr-icon[data-pair="' + pairIdx + '"]').forEach((s) => s.classList.add('tr-icon-active'));
-  }
-  trActivePair = { pageNum, idx: pairIdx };
-  // 定位：锚点片段视口矩形下方居中；不够则上方；再夹在视口内
-  const r = anchorEl.getBoundingClientRect();
-  const pw = pop.offsetWidth, ph = pop.offsetHeight;
-  let left = r.left + r.width / 2 - pw / 2;
-  let top = r.bottom + 8;
-  if (top + ph > window.innerHeight - 8) top = r.top - ph - 8;
-  left = Math.max(8, Math.min(left, window.innerWidth - pw - 8));
-  top = Math.max(8, top);
-  pop.style.left = Math.round(left) + 'px';
-  pop.style.top = Math.round(top) + 'px';
+  const seq = ++trPopupSeq;
+  trRenderPopupContent(pop, zh).then(() => {
+    if (seq !== trPopupSeq) return; // 期间已被新弹层取代
+    pop.style.display = 'block';
+    const tl = rs.textLayers && rs.textLayers[pageNum];
+    if (tl) {
+      tl.container.querySelectorAll('span.tr-sent[data-pair="' + pairIdx + '"]').forEach((s) => s.classList.add('tr-active'));
+      tl.container.querySelectorAll('.tr-underline[data-pair="' + pairIdx + '"]').forEach((s) => s.classList.add('tr-active'));
+      tl.container.querySelectorAll('.tr-icon[data-pair="' + pairIdx + '"]').forEach((s) => s.classList.add('tr-icon-active'));
+    }
+    trActivePair = { pageNum, idx: pairIdx };
+    // 定位：锚点片段视口矩形下方居中；不够则上方；再夹在视口内
+    const r = anchorEl.getBoundingClientRect();
+    const pw = pop.offsetWidth, ph = pop.offsetHeight;
+    let left = r.left + r.width / 2 - pw / 2;
+    let top = r.bottom + 8;
+    if (top + ph > window.innerHeight - 8) top = r.top - ph - 8;
+    left = Math.max(8, Math.min(left, window.innerWidth - pw - 8));
+    top = Math.max(8, top);
+    pop.style.left = Math.round(left) + 'px';
+    pop.style.top = Math.round(top) + 'px';
+  });
 }
 
 // 点句弹 ZH 浮层（事件委托）；选区展开时让位 M4 高亮菜单
