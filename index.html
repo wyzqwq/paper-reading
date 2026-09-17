@@ -3497,6 +3497,15 @@ function onReaderSelectionChange() {
     }
     if (anchor && anchor.parentElement) {
       const parentTextLayer = anchor.parentElement.closest('.textLayer');
+      // v3 翻译修复：tr-sent 嵌进叶子 span 后，anchor 会被解析成 tr-sent 等嵌套元素，导致 endOfContent
+      // 被插进叶子内部（叶子的 absolute+transform 成为它的定位/层叠上下文，指针划过空白命中错位的
+      // 巨型 eoc 时选区跳到页底、来回震荡，"划半天选不上"）。提升到 textLayer 直接子级（叶子 span）
+      // 再插入，与官方 anchor 恒为叶子 span 的语义一致（官方无嵌套结构故无此问题）。
+      if (parentTextLayer && anchor.parentElement !== parentTextLayer) {
+        let leaf = anchor;
+        while (leaf.parentElement && leaf.parentElement !== parentTextLayer) leaf = leaf.parentElement;
+        anchor = leaf;
+      }
       if (parentTextLayer) {
         const pageNum = Number(parentTextLayer.dataset.pageNum);
         const tlInfo = rs.textLayers[pageNum];
