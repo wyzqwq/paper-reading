@@ -2729,7 +2729,7 @@ function toast(msg, ms) {
 
 // 缓存版本：拼进 source_hash（sha256(TR_CACHE_VERSION + text)）。空串=初始版，与既有缓存 sha256(text) 兼容；
 // 改 Edge Function 的 SYSTEM_PROMPT / DEEPSEEK_MODEL 时同步 bump（'v2'/'v3'...），旧缓存 hash 不符自动失效重译。
-const TR_CACHE_VERSION = 'img1'; // bump: 数学页读图通道（页图传 DeepSeek 以图重建公式 LaTeX）+ prompt 规则8，旧缓存 hash 不符自动失效重译
+const TR_CACHE_VERSION = 'img2'; // bump: 每页都传图（v2.1.1，上标丢失文本侧不可检测），旧 img1 缓存失效重译
 
 // 分块上限：2000 时 body 含 ctx 标记可达 2100+，偶发 546（p3 chunk1 2132 失败/p2 2118 成功，DeepSeek 响应波动），1500 更稳
 const TR_CHUNK_SIZE = 1500;
@@ -2797,22 +2797,13 @@ async function trExtractPageText(pageNum) {
   return s;
 }
 
-// ---- v2.1 数学页读图通道 ----
+// ---- v2.1 页图读图通道 ----
 // 背景：textLayer 提取的公式是乱序+字形映射错乱的字符流（∫→~、ζ→Z、+→4-），提取侧无真值可恢复；
-// 真值只在渲染像素里。数学页把页图（离屏渲染 JPEG）随文本一起传 DeepSeek（deepseek-flash 支持读图），
+// 真值只在渲染像素里。把页图（离屏渲染 JPEG）随文本一起传 DeepSeek（deepseek-flash 支持读图），
 // prompt 指示公式以图为准重建为 LaTeX。图片经 DeepSeek 统一缩至 ~1300×1300、每张 ≤1024 token，
-// 成本约 ¥0.002/页，忽略不计，故不做开关、仅数学页（启发式命中）走此通道，纯文字页零变化。
-
-// 数学页启发式：含特殊数学符号，或 ≥2 行含 '='（公式行特征；普通散文极少出现）
-function trIsMathPage(text) {
-  if (!text) return false;
-  if (/[∂∑∇∫≈′ℓξζΠΣ]/.test(text)) return true;
-  let eq = 0;
-  for (const l of text.split('\n')) {
-    if (l.includes('=') && l.trim().length > 2 && ++eq >= 2) return true;
-  }
-  return false;
-}
+// 成本约 ¥0.002/页，忽略不计，不做开关。
+// v2.1.1：去掉"数学页启发式"门槛，每页都传图。原因：上标丢失（8⁴ 提取成 "84"）从文本侧
+// 不可检测——纯数字无法区分真数字和丢了上标的数字，只有像素里有真值；启发式漏判页公式照乱。
 
 // 离屏渲染页图：宽 ~1300px（与 DeepSeek 服务端缩放档一致），白底 JPEG 0.82 → data URL。
 // 独立于阅读器当前缩放/夜间模式（拿原始像素，非反色 CSS 效果），输出确定性；用完立即释放。
@@ -2973,7 +2964,7 @@ async function trEnsurePairs(pageNum) {
   // 跨页上下文：前页末尾 + 后页开头，让 DeepSeek 理解跨页句（只译本页 <page>，ctx 不译）
   const prevCtx = pageNum > 1 ? await trGetCtx(pageNum - 1, 'tail') : '';
   const nextCtx = pageNum < rs.numPages ? await trGetCtx(pageNum + 1, 'head') : '';
-  const image = trIsMathPage(text) ? await trRenderPageImage(pageNum) : '';
+  const image = await trRenderPageImage(pageNum); // v2.1.1：每页都传图（上标丢失文本侧不可检测）
   const pairs = await trCallProxy(text, { prevCtx, nextCtx, image });
   console.log('[tr] p' + pageNum, '代理返回 pairs=' + (pairs ? pairs.length : 'null'));
   if (!rs.tr || rs.tr.cancelled) return null; // 调用期间被取消
@@ -3000,7 +2991,7 @@ async function trRetranslatePage(pageNum) {
   if (text.trim()) {
     const prevCtx = pageNum > 1 ? await trGetCtx(pageNum - 1, 'tail') : '';
     const nextCtx = pageNum < rs.numPages ? await trGetCtx(pageNum + 1, 'head') : '';
-    const image = trIsMathPage(text) ? await trRenderPageImage(pageNum) : '';
+    const image = await trRenderPageImage(pageNum); // v2.1.1：每页都传图（上标丢失文本侧不可检测）
     try { pairs = await trCallProxy(text, { prevCtx, nextCtx, image }); }
     catch (e) { trApplyError('重译失败：' + ((e && e.message) || e)); tr.pages[pageNum].status = 'error'; trRenderStatus(); return; }
     if (!rs.tr || rs.tr.cancelled) return;
