@@ -2,7 +2,7 @@
 // P0：waiting 模式（install 不 skipWaiting，等页面 postMessage SKIP_WAITING 才接管），
 // 配合"有新版本"横幅让用户决定何时刷新，不在阅读中途强制 reload 丢阅读现场。
 // P0：导航 network-first（总拿新版，离线回缓存）；资源 cache-first + res.ok 守卫。
-const CACHE = 'paper-reading-v30';
+const CACHE = 'paper-reading-v31'; // v31: 翻译 ctx 泄漏幻影对修（<page> 包裹 + 响应过滤，v2.1.4）
 const SHELL = [
   './',
   './index.html',

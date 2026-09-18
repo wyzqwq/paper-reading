@@ -2896,6 +2896,9 @@ async function trCallProxySingle(payload) {
 
 // 翻译整页文本：分块（避超时 504）+ 跨页上下文（首块带 prevCtx、末块带 nextCtx，<ctx_*> 标记供 Edge Function 识别只译 <page>）
 // 数学页 opts.image（页图 data URL）只附在首块
+// v2.1.4：本页文本用 <page>...</page> 包裹（Edge prompt 第 7 条「只译 <page> 内文本」，此前漏加致模型猜页界，
+// 偶发把 ctx（常是次页图标签堆）也翻进 pairs —— 幻影对在本页匹配必失败，状态栏 m/N 虚低但视觉全译）。
+// 响应侧再过滤兜底：en 折叠后不在本 chunk 正文但在 ctx 里 = ctx 泄漏对，丢弃（正文先查防误杀）。
 async function trCallProxy(text, opts) {
   const rs = readerState;
   const prevCtx = opts && opts.prevCtx;
@@ -2906,14 +2909,40 @@ async function trCallProxy(text, opts) {
   const all = [];
   for (let i = 0; i < chunks.length; i++) {
     if (rs && rs.tr && (rs.tr.cancelled || !rs.tr.enabled)) throw new Error('已取消');
-    let body = chunks[i];
+    let body = '<page>' + chunks[i] + '</page>';
     if (i === 0 && prevCtx) body = '<ctx_prev>' + prevCtx + '</ctx_prev>\n' + body;
     if (i === chunks.length - 1 && nextCtx) body += '\n<ctx_next>' + nextCtx + '</ctx_next>';
     console.log('[tr] chunk ' + (i + 1) + '/' + chunks.length, 'len=' + body.length, i === 0 && image ? '+img' : '');
     let pairs;
     try { pairs = await trCallProxySingle(i === 0 ? { text: body, image } : { text: body }); }
     catch (e) { console.log('[tr] chunk ' + (i + 1) + ' 失败:', e.message); throw e; }
-    if (Array.isArray(pairs)) all.push(...pairs);
+    if (Array.isArray(pairs)) {
+      // v2.1.4 ctx 泄漏过滤：对 chunk 正文 fold 串做单调顺序匹配（与 trApplyPage 同构）——
+      // 正文流内按序找到 = 真句；不在流内且在 ctx 串里 = 泄漏对，丢（短标签如 "abstract" 恰是正文字串，
+      // 单靠"正文含"判据残留；顺序判据下它排在正文流末尾之后，不误留）。漂移/乱序/跨块句两边都不中，照旧计入。
+      const ctxSrc = ((i === 0 ? prevCtx : '') + '\n' + (i === chunks.length - 1 ? nextCtx : '')).trim();
+      const ctxFold = ctxSrc ? trFoldStr(ctxSrc) : '';
+      const ctxWs = ctxSrc ? ctxSrc.replace(/\s+/g, '') : ''; // 去空白直比：trFoldStr 把 [–-−] 区间符号（含 •）折成 '-' 可能再被连字符规则吃掉，符号类碎片靠这条兜住
+      const inCtx = (f, fWs) => (ctxFold && ctxFold.indexOf(f) >= 0) || (ctxWs && ctxWs.indexOf(fWs) >= 0);
+      const chunkFold = trFoldStr(chunks[i]);
+      let flowPos = 0;
+      const before = pairs.length;
+      pairs = pairs.filter((p) => {
+        const en = (p && p.en) || '';
+        const f = trFoldStr(en);
+        const fWs = en.replace(/\s+/g, '');
+        if (!f && !fWs) return true;
+        // 平凡碎片（纯符号/超短，如 ctx 里的 "•"）：流内也不算真句，在 ctx 出现即丢
+        const trivial = f.length < 4 || !/[A-Za-z0-9一-鿿]/.test(f);
+        if (trivial && inCtx(f, fWs)) return false;
+        const idx = chunkFold.indexOf(f, flowPos);
+        if (idx >= 0) { flowPos = idx + f.length; return true; } // 正文顺序内：真句
+        if (inCtx(f, fWs)) return false;                        // 不在正文流内、在 ctx：泄漏，丢
+        return true;                                             // 漂移/乱序/跨块：留，匹配失败如实反映
+      });
+      if (pairs.length !== before) console.log('[tr] chunk ' + (i + 1) + ' 过滤 ctx 泄漏对 ' + (before - pairs.length) + ' 个');
+      all.push(...pairs);
+    }
   }
   return all;
 }
