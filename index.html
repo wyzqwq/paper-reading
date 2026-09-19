@@ -3473,10 +3473,23 @@ function trShowPopup(pageNum, pairIdx, anchorEl) {
       tl.container.querySelectorAll('.tr-icon[data-pair="' + pairIdx + '"]').forEach((s) => s.classList.add('tr-icon-active'));
     }
     trActivePair = { pageNum, idx: pairIdx };
-    // 定位：锚点片段视口矩形下方居中；不够则上方；再夹在视口内
-    const r = anchorEl.getBoundingClientRect();
+    // 定位（v2.1.5）：统一锚到整句联合矩形（该 pair 全部片段 + 句尾图标），译文放整句下方居中——
+    // 不再锚点击/切到的单个片段：导航路径此前锚第一个片段，多行句译文盖住后半句原文。
+    // 下方放不下翻到整句上方（盖上文，不盖本句）；再夹在视口内。
+    let r = null;
+    if (tl) {
+      tl.container.querySelectorAll('span.tr-sent[data-pair="' + pairIdx + '"], .tr-icon[data-pair="' + pairIdx + '"]').forEach((s) => {
+        const b = s.getBoundingClientRect();
+        if (!r) r = { left: b.left, top: b.top, right: b.right, bottom: b.bottom };
+        else {
+          r.left = Math.min(r.left, b.left); r.top = Math.min(r.top, b.top);
+          r.right = Math.max(r.right, b.right); r.bottom = Math.max(r.bottom, b.bottom);
+        }
+      });
+    }
+    if (!r) { const b = anchorEl.getBoundingClientRect(); r = { left: b.left, top: b.top, right: b.right, bottom: b.bottom }; } // 兜底：无包裹片段时退回锚元素
     const pw = pop.offsetWidth, ph = pop.offsetHeight;
-    let left = r.left + r.width / 2 - pw / 2;
+    let left = r.left + (r.right - r.left) / 2 - pw / 2;
     let top = r.bottom + 8;
     if (top + ph > window.innerHeight - 8) top = r.top - ph - 8;
     left = Math.max(8, Math.min(left, window.innerWidth - pw - 8));
