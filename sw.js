@@ -2,7 +2,7 @@
 // P0：waiting 模式（install 不 skipWaiting，等页面 postMessage SKIP_WAITING 才接管），
 // 配合"有新版本"横幅让用户决定何时刷新，不在阅读中途强制 reload 丢阅读现场。
 // P0：导航 network-first（总拿新版，离线回缓存）；资源 cache-first + res.ok 守卫。
-const CACHE = 'paper-reading-v32'; // v32: 译文弹层统一锚整句联合矩形（导航切句不再盖本句原文，v2.1.5）
+const CACHE = 'paper-reading-v33'; // v33: trFoldStr 区间误伤修 + 希腊/数学形近字归一（v2.1.6）
 const SHELL = [
   './',
   './index.html',

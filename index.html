@@ -3146,7 +3146,7 @@ function trBuildTextMap(pageNum) {
   }
   // level5 用：折叠字符级差异（弯直引号/dash 归一 + 去断词连字符 + 去空白）+ 每个 fold 字符对应的 raw 偏移
   // 救 DeepSeek 字符级 verbatim 漂移：断词 knowl-\nedge->knowledge、弯引号 ‘->' 、dash –->- （5 agent 实测 15-20% 漏句主因）
-  const FOLD = { '‘':"'", '’':"'", '‚':"'", '‛':"'", '“':'"', '”':'"', '„':'"', '‟':'"', '–':'-', '—':'-', '−':'-' };
+  const FOLD = { '‘':"'", '’':"'", '‚':"'", '‛':"'", '“':'"', '”':'"', '„':'"', '‟':'"', '–':'-', '—':'-', '−':'-', 'Δ':'∆', 'Σ':'∑', 'Π':'∏' }; // v2.1.6：+希腊↔数学形近字（与 trFoldStr 对称；∆/∑/∏ 为规范形）
   let fold = '';
   const foldToRaw = [];
   for (let j = 0; j < raw.length; j++) {
@@ -3170,7 +3170,8 @@ function trFoldStr(s) {
   return s
     .replace(/[‘’‚‛]/g, "'")
     .replace(/[“”„‟]/g, '"')
-    .replace(/[–-−]/g, '-')
+    .replace(/[–−]/g, '-') // v2.1.6：原 [–-−] 实为 U+2013–U+2212 区间（∆/∑/∏/×/• 全折成 '-'，en 侧独有致与 map.fold 不对称）——收窄为两字符字面量
+    .replace(/Δ/g, '∆').replace(/Σ/g, '∑').replace(/Π/g, '∏') // v2.1.6：希腊↔数学形近字归一（模型看页图常返回 Δ，抄不出文字层的 ∆）
     .replace(/\s+/g, '')
     .replace(/([a-zA-Z])-(?=[a-zA-Z])/g, '$1');
 }
