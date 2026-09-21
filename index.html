@@ -2743,7 +2743,7 @@ function toast(msg, ms) {
 
 // 缓存版本：拼进 source_hash（sha256(TR_CACHE_VERSION + text)）。空串=初始版，与既有缓存 sha256(text) 兼容；
 // 改 Edge Function 的 SYSTEM_PROMPT / DEEPSEEK_MODEL 时同步 bump（'v2'/'v3'...），旧缓存 hash 不符自动失效重译。
-const TR_CACHE_VERSION = 'img2'; // bump: 每页都传图（v2.1.1，上标丢失文本侧不可检测），旧 img1 缓存失效重译
+const TR_CACHE_VERSION = 'eq1'; // bump: prompt 改公式整块合并 + 跨页句首句 zh 含上页部分（v2.1.7），旧缓存失效重译
 
 // 分块上限：2000 时 body 含 ctx 标记可达 2100+，偶发 546（p3 chunk1 2132 失败/p2 2118 成功，DeepSeek 响应波动），1500 更稳
 const TR_CHUNK_SIZE = 1500;
