@@ -2743,7 +2743,7 @@ function toast(msg, ms) {
 
 // 缓存版本：拼进 source_hash（sha256(TR_CACHE_VERSION + text)）。空串=初始版，与既有缓存 sha256(text) 兼容；
 // 改 Edge Function 的 SYSTEM_PROMPT / DEEPSEEK_MODEL 时同步 bump（'v2'/'v3'...），旧缓存 hash 不符自动失效重译。
-const TR_CACHE_VERSION = 'eq1'; // bump: prompt 改公式整块合并 + 跨页句首句 zh 含上页部分（v2.1.7），旧缓存失效重译
+const TR_CACHE_VERSION = 'eq2'; // bump: 多 chunk 页图片泄漏修复——pairs 带 ci 来源标 + 分组匹配（v2.1.9）、prompt 第 8 条禁译 <page> 外内容；旧缓存无 ci 标退化单组匹配，重译才完整生效（v2.1.7 为 'eq1'）
 
 // 分块上限：2000 时 body 含 ctx 标记可达 2100+，偶发 546（p3 chunk1 2132 失败/p2 2118 成功，DeepSeek 响应波动），1500 更稳
 const TR_CHUNK_SIZE = 1500;
@@ -2941,6 +2941,7 @@ async function trCallProxy(text, opts) {
         return true;                                             // 漂移/乱序/跨块：留，匹配失败如实反映
       });
       if (pairs.length !== before) console.log('[tr] chunk ' + (i + 1) + ' 过滤 ctx 泄漏对 ' + (before - pairs.length) + ' 个');
+      pairs.forEach((p) => { p.ci = i; }); // v2.1.9：来源 chunk 标，trApplyPage 按组匹配（图片泄漏对去重；随 pairs 一起进缓存）
       all.push(...pairs);
     }
   }
@@ -3286,14 +3287,39 @@ function trApplyPage(pageNum) {
   trUnwrapPage(pageEl); // 清旧（重译/重铺）
   const map = trBuildTextMap(pageNum);
   if (!map) return;
-  let pos = 0, matched = 0;
-  for (let i = 0; i < pg.pairs.length; i++) {
-    const en = pg.pairs[i] && pg.pairs[i].en;
-    const found = trFindOffset(map, en, pos);
-    if (found && found.start >= pos) { trWrapSentence(pageEl, found.start, found.end, i); pos = found.end; matched++; }
-    // 匹配失败/倒退：该句不可点，pos 不动（下一句从同位置继续找）；found.start<pos 视为失败防 pos 倒退
-  }
+  // v2.1.9 匹配策略：按来源 chunk 分组（trCallProxy 打 ci 标）+ 组内单调 + 跨组重叠去重。
+  // 根因：多 chunk 页（页文本 >1500）页图只随 chunk1 发，模型看整页图常把 <page> 之外的
+  // 同页内容（chunk2/3 领地）也翻出来混进 chunk1 响应（图片泄漏对）；纯单调匹配下泄漏对把
+  // pos 推到页中/页尾，后续真实对 start<pos 全挂（视觉全覆盖但 m/N 虚低，DiLA p13 /
+  // DreamDojo p2）。改按组：每组从 0 单调定位（组内原顺序，重复短文本如表格格值可按序落位），
+  // 跨组重叠 = 泄漏对与真实对争同一段文本，先到先得（两者 zh 都是该句的正常译文，无功能差异）；
+  // 组内单调失败再 from-0 兜底（漂移句），仍找不到或重叠则丢（不可点且虚增 N）。最后按位置
+  // 排序、pg.pairs 重写为留存数组（data-pair 新索引一致重建）。单 chunk 页单组 = 原行为 + 去重。
+  const orig = pg.pairs;
+  const ivs = []; // 已占 [start,end) 区间
+  const kept = []; // {p, start, end}
+  let missDropped = 0, dupDropped = 0;
+  const groups = new Map();
+  orig.forEach((p) => { const g = (p && typeof p.ci === 'number') ? p.ci : 0; if (!groups.has(g)) groups.set(g, []); groups.get(g).push(p); });
+  [...groups.keys()].sort((a, b) => a - b).forEach((g) => {
+    let w = 0; // 组起点：组自身首对 from-0 定位即其真实领地（不被前组泄漏对的越界占位带偏）
+    for (const p of groups.get(g)) {
+      const en = p && p.en;
+      let f = trFindOffset(map, en, w);
+      if (!f) f = trFindOffset(map, en, 0); // 组内单调失败 → from-0 兜底
+      if (!f) { missDropped++; continue; }
+      if (ivs.some((v) => f.start < v.end && f.end > v.start)) { dupDropped++; continue; } // 跨组重复：泄漏对 vs 真实对
+      kept.push({ p, start: f.start, end: f.end });
+      ivs.push(f);
+      if (f.end > w) w = f.end; // 组内推进（兜底命中更早位置时 w 不回退）
+    }
+  });
+  kept.sort((a, b) => a.start - b.start);
+  pg.pairs = kept.map((l) => l.p);
+  let matched = 0;
+  kept.forEach((l, k) => { trWrapSentence(pageEl, l.start, l.end, k); matched++; });
   pg.matched = matched;
+  if (dupDropped || missDropped) console.log('[tr] p' + pageNum + ' 丢弃重复/泄漏对 ' + dupDropped + '、定位失败对 ' + missDropped);
   trPaintUnderlines(pageEl);
 }
 

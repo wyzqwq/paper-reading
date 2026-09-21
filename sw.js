@@ -2,7 +2,7 @@
 // P0：waiting 模式（install 不 skipWaiting，等页面 postMessage SKIP_WAITING 才接管），
 // 配合"有新版本"横幅让用户决定何时刷新，不在阅读中途强制 reload 丢阅读现场。
 // P0：导航 network-first（总拿新版，离线回缓存）；资源 cache-first + res.ok 守卫。
-const CACHE = 'paper-reading-v35'; // v35: trFoldStr 补 U+2014 em-dash（v2.1.8 修 v2.1.6 收窄引入的折叠回归）
+const CACHE = 'paper-reading-v37'; // v37: v2.1.9 多 chunk 页图片泄漏对修复——trCallProxy 打 ci 来源标 + trApplyPage 按 chunk 分组单调匹配 + 跨组区间去重；TR_CACHE_VERSION bump eq2 旧译文缓存失效重译
 const SHELL = [
   './',
   './index.html',
