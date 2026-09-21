@@ -2743,7 +2743,7 @@ function toast(msg, ms) {
 
 // 缓存版本：拼进 source_hash（sha256(TR_CACHE_VERSION + text)）。空串=初始版，与既有缓存 sha256(text) 兼容；
 // 改 Edge Function 的 SYSTEM_PROMPT / DEEPSEEK_MODEL 时同步 bump（'v2'/'v3'...），旧缓存 hash 不符自动失效重译。
-const TR_CACHE_VERSION = 'eq2'; // bump: 多 chunk 页图片泄漏修复——pairs 带 ci 来源标 + 分组匹配（v2.1.9）、prompt 第 8 条禁译 <page> 外内容；旧缓存无 ci 标退化单组匹配，重译才完整生效（v2.1.7 为 'eq1'）
+const TR_CACHE_VERSION = 'eq3'; // bump: 跨页切断句结构性合并（frag 并入 <page> 首部 + en 前缀剥离，v2.1.10）——旧缓存跨页句 zh 只有后半截，重译才完整；v2.1.9 为 'eq2'（ci 分组匹配）
 
 // 分块上限：2000 时 body 含 ctx 标记可达 2100+，偶发 546（p3 chunk1 2132 失败/p2 2118 成功，DeepSeek 响应波动），1500 更稳
 const TR_CHUNK_SIZE = 1500;
@@ -2788,6 +2788,66 @@ async function trGetCtx(pageNum, dir) {
     const picked = dir === 'tail' ? sents.slice(-2) : sents.slice(0, 2);
     return picked.join(' ').slice(0, 600); // 限长防 ctx 过大
   } catch { return ''; }
+}
+
+// v2.1.10 跨页切断检测：前页末尾无终止标点（句被跨页切断）→ frag = ctx 最后真句末标点后的片段
+// （去尾页码），ctx = 其前的完整句（frag 已并入 <page>，ctx_prev 里不再留，防重复）。frag 平凡
+// （太短/无字母，如页码或 URL 尾巴 "04261"）= 无有效切断，ctx 原样返回、frag 空（走旧行为）。
+// 句末识别跳过缩写词句点（Fig./et al./e.g./Eq./No./单字母缩写等）——trGetCtx 的朴素切分在
+// "Fig. 5(A)" 处断句后拼回的 ctx 仍含 "Fig."，不跳过会让 frag 从 "5(A)," 起头、丢掉
+// "As shown in Fig." 前缀（DiLA p6→p7 实测踩坑）。
+function trSplitCutFrag(prevCtx) {
+  if (!prevCtx) return { ctx: '', frag: '' };
+  let bi = -1;
+  for (let i = prevCtx.length - 1; i >= 0; i--) {
+    const ch = prevCtx[i];
+    if (ch !== '.' && ch !== '!' && ch !== '?' && ch !== ';') continue;
+    if (ch === '.') {
+      const w = (/[A-Za-z]{1,4}$/.exec(prevCtx.slice(0, i)) || [''])[0].toLowerCase();
+      if (w && (w.length <= 1 || /^(fig|figs|eq|eqs|sec|secs|tab|tabs|no|nos|vs|cf|al|etc)$/.test(w))) continue;
+    }
+    bi = i; break;
+  }
+  let frag = bi >= 0 ? prevCtx.slice(bi + 1) : prevCtx;
+  let ctx = bi >= 0 ? prevCtx.slice(0, bi + 1) : '';
+  frag = frag.replace(/\s*\n\s*\d{1,3}\s*$/, '').trim();
+  ctx = ctx.trim();
+  if (frag.length < 4 || !/[A-Za-z]/.test(frag)) return { ctx: prevCtx, frag: '' };
+  return { ctx, frag };
+}
+
+// v2.1.10 前缀剥离：en 的非空白字符按序累积，恰好耗尽 frag 的非空白串即 frag 前缀结束，返回剩余
+// （空白不敏感——模型拷贝时换行/空格可能变）；中途分叉或未耗尽（en 恰好 === frag 整对）返回 null。
+function trStripCutPrefix(en, frag) {
+  const fw = frag.replace(/\s+/g, '');
+  if (!fw) return null;
+  let acc = '';
+  for (let i = 0; i < en.length; i++) {
+    if (/\s/.test(en[i])) continue;
+    acc += en[i];
+    if (acc === fw) { let j = i + 1; while (j < en.length && /\s/.test(en[j])) j++; return en.slice(j); }
+    if (fw.indexOf(acc) !== 0) return null;
+  }
+  return null;
+}
+
+// v2.1.10：结构性合并后处理——首块 pair 的 en 若以 frag 开头（模型把 frag+页眉+续句整句逐字拷贝），
+// 剥掉 frag 前缀，其后再剥页眉行前缀（真 API 实测模型常把页眉也一并拷进 en，如 "…within\nDiLA:
+// Disentangled…\nthe structure embeddings…"），剥出纯 <page> 正文便于 trApplyPage 对 map 匹配定位；
+// zh 已是完整句译文原样保留（这正是合并的意义）。en === frag 的重复对不动（匹配失败由 trApplyPage 如实丢弃）。
+function trStripFragPairs(pairs, frag, pageText) {
+  const header = (pageText.split('\n')[0] || '').trim();
+  let stripped = 0;
+  pairs.forEach((p) => {
+    const en = p && typeof p.en === 'string' ? p.en : '';
+    if (!en) return;
+    const st = trStripCutPrefix(en, frag);
+    if (st === null || !st.trim()) return;
+    const st2 = (header && trStripCutPrefix(st, header)) || st; // 页眉前缀可剥则剥，剥不掉保持原样
+    p.en = st2.trim() ? st2 : st;
+    stripped++;
+  });
+  if (stripped) console.log('[tr] 跨页合并：剥离 ' + stripped + ' 对的 frag 前缀');
 }
 
 // 取某页 textLayer 全文（复用 textContentCache；无则 streamTextContent 聚合，iOS 兼容见 aggregateTextContentStream）
@@ -2899,17 +2959,25 @@ async function trCallProxySingle(payload) {
 // v2.1.4：本页文本用 <page>...</page> 包裹（Edge prompt 第 7 条「只译 <page> 内文本」，此前漏加致模型猜页界，
 // 偶发把 ctx（常是次页图标签堆）也翻进 pairs —— 幻影对在本页匹配必失败，状态栏 m/N 虚低但视觉全译）。
 // 响应侧再过滤兜底：en 折叠后不在本 chunk 正文但在 ctx 里 = ctx 泄漏对，丢弃（正文先查防误杀）。
+// v2.1.10：opts.cutFrag（上页被切断句的开头，trSplitCutFrag 算出）并入首块 <page> 文本首部——
+// 结构性合并：模型只是正常翻译一个完整句（不再依赖它执行「把 ctx 并入 zh」的指令，deepseek-flash 关
+// thinking 下该指令实测 ~50% 遵守率）；响应后 trStripFragPairs 把 en 的 frag/页眉前缀剥掉（页 map 里没有
+// frag 文本），zh 已是完整句译文原样入缓存。真 API 实测 dila p7/p17、dreamdojo p7 边界 9/9 合并成功。
 async function trCallProxy(text, opts) {
   const rs = readerState;
   const prevCtx = opts && opts.prevCtx;
   const nextCtx = opts && opts.nextCtx;
   const image = (opts && opts.image) || '';
+  const cutFrag = (opts && opts.cutFrag) || '';
   const chunks = trSplitText(text, TR_CHUNK_SIZE);
   if (chunks.length === 0) return [];
   const all = [];
   for (let i = 0; i < chunks.length; i++) {
     if (rs && rs.tr && (rs.tr.cancelled || !rs.tr.enabled)) throw new Error('已取消');
-    let body = '<page>' + chunks[i] + '</page>';
+    // v2.1.10：上页切断句开头并入首块（单 \n 同段，避免被 trSplitText 当独立段落拆成单独 chunk）
+    let ct = chunks[i];
+    if (i === 0 && cutFrag) ct = cutFrag + '\n' + ct;
+    let body = '<page>' + ct + '</page>';
     if (i === 0 && prevCtx) body = '<ctx_prev>' + prevCtx + '</ctx_prev>\n' + body;
     if (i === chunks.length - 1 && nextCtx) body += '\n<ctx_next>' + nextCtx + '</ctx_next>';
     console.log('[tr] chunk ' + (i + 1) + '/' + chunks.length, 'len=' + body.length, i === 0 && image ? '+img' : '');
@@ -2941,6 +3009,7 @@ async function trCallProxy(text, opts) {
         return true;                                             // 漂移/乱序/跨块：留，匹配失败如实反映
       });
       if (pairs.length !== before) console.log('[tr] chunk ' + (i + 1) + ' 过滤 ctx 泄漏对 ' + (before - pairs.length) + ' 个');
+      if (i === 0 && cutFrag) trStripFragPairs(pairs, cutFrag, text); // v2.1.10：剥 en 的 frag/页眉前缀（zh 完整句不动）
       pairs.forEach((p) => { p.ci = i; }); // v2.1.9：来源 chunk 标，trApplyPage 按组匹配（图片泄漏对去重；随 pairs 一起进缓存）
       all.push(...pairs);
     }
@@ -3006,10 +3075,12 @@ async function trEnsurePairs(pageNum) {
   tr.pages[pageNum] = Object.assign(tr.pages[pageNum] || {}, { status: 'translating' });
   trRenderStatus();
   // 跨页上下文：前页末尾 + 后页开头，让 DeepSeek 理解跨页句（只译本页 <page>，ctx 不译）
-  const prevCtx = pageNum > 1 ? await trGetCtx(pageNum - 1, 'tail') : '';
+  // v2.1.10：前页末尾被切断的句子，开头（frag）并入本页 <page> 首部结构性合并（见 trCallProxy）
+  const prevRaw = pageNum > 1 ? await trGetCtx(pageNum - 1, 'tail') : '';
+  const cut = trSplitCutFrag(prevRaw);
   const nextCtx = pageNum < rs.numPages ? await trGetCtx(pageNum + 1, 'head') : '';
   const image = await trRenderPageImage(pageNum); // v2.1.1：每页都传图（上标丢失文本侧不可检测）
-  const pairs = await trCallProxy(text, { prevCtx, nextCtx, image });
+  const pairs = await trCallProxy(text, { prevCtx: cut.ctx, cutFrag: cut.frag, nextCtx, image });
   console.log('[tr] p' + pageNum, '代理返回 pairs=' + (pairs ? pairs.length : 'null'));
   if (!rs.tr || rs.tr.cancelled) return null; // 调用期间被取消
   await dbPutTranslation({ id: (cached && cached.id) || uid(), user_id: userId, paper_id: paperId, page_num: pageNum, pairs, source_hash: hash });
@@ -3033,10 +3104,11 @@ async function trRetranslatePage(pageNum) {
   const hash = await sha256Hex(TR_CACHE_VERSION + text);
   let pairs = [];
   if (text.trim()) {
-    const prevCtx = pageNum > 1 ? await trGetCtx(pageNum - 1, 'tail') : '';
+    const prevRaw = pageNum > 1 ? await trGetCtx(pageNum - 1, 'tail') : '';
+    const cut = trSplitCutFrag(prevRaw); // v2.1.10：跨页切断句开头并入 <page> 首部
     const nextCtx = pageNum < rs.numPages ? await trGetCtx(pageNum + 1, 'head') : '';
     const image = await trRenderPageImage(pageNum); // v2.1.1：每页都传图（上标丢失文本侧不可检测）
-    try { pairs = await trCallProxy(text, { prevCtx, nextCtx, image }); }
+    try { pairs = await trCallProxy(text, { prevCtx: cut.ctx, cutFrag: cut.frag, nextCtx, image }); }
     catch (e) { trApplyError('重译失败：' + ((e && e.message) || e)); tr.pages[pageNum].status = 'error'; trRenderStatus(); return; }
     if (!rs.tr || rs.tr.cancelled) return;
   }

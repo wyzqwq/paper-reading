@@ -47,8 +47,8 @@ const SYSTEM_PROMPT = [
   '4. 数学公式、变量符号(如 x²、α、∇)、代码、URL、参考文献编号 不翻译,只译周围文字。',
   '5. 已是中文的片段跳过不译,en 照抄、zh 留原样或空。',
   '6. 句子间顺序与原文一致;不要增删句子;不要加任何解释/前言/后语,只输出 JSON。',
-  '7. 用户消息可能含 <page>本页文本</page> + <ctx_prev>上一页末尾</ctx_prev> / <ctx_next>下一页开头</ctx_next> 上下文。只翻译 <page> 内的文本(它才是当前页),<ctx_*> 不出现在 sentences 的 en 里。本页首尾可能是不完整句(跨页切断):开头延续上页的不完整句,该句 zh 要翻译完整句——把 <ctx_prev> 中该句的开头部分一并译入本页这条的 zh,让结束页看到整句译文;en 仍只拷 <page> 内文字(前端按本页偏移定位)。结尾被切断的半句照常只译本页部分。',
-  '8. 用户消息可能附一张图:该页 PDF 的原始渲染图像。文本来自 PDF 文字层,数学公式的字形映射可能错乱(如 ∫ 提取成 ~、ζ 提取成 Z、+ 提取成 4-),上下标也可能乱序。有图时公式一律以图像为准:在 zh 里把公式重建为正确的 LaTeX,行内公式用 $...$ 包裹、独立公式用 $$...$$ 包裹;务必保持符号、上下标、希腊字母与图中一致。无图时按上下文语义尽力重建。en 仍逐字拷贝文字层原文(不得按图改写,定位依赖它)。图片仅供理解当前 <page> 文本;图片中超出 <page> 文本范围的内容(页内更后面的正文)一律不译、不得出现在 sentences 输出里。',
+  '7. 用户消息可能含 <page>本页文本</page> + <ctx_prev>上一页末尾</ctx_prev> / <ctx_next>下一页开头</ctx_next>。只翻译 <page> 内的文本(它才是当前页),<ctx_*> 的文字不得出现在 sentences 的 en 里。<page> 首部单独一行可能是上一页被切断句子的开头(与后续文字同属一句)——正常作一个完整句翻译即可,en 照常逐字拷贝 <page> 内文字(含该行)。<page> 结尾被切断的半句照常只译本页部分。',
+  '8. 用户消息可能附一张图:该页 PDF 的原始渲染图像。文本来自 PDF 文字层,数学公式的字形映射可能错乱(如 ∫ 提取成 ~、ζ 提取成 Z、+ 提取成 4-),上下标也可能乱序。有图时公式一律以图像为准:在 zh 里把公式重建为正确的 LaTeX,行内公式用 $...$ 包裹、独立公式用 $$...$$ 包裹;务必保持符号、上下标、希腊字母与图中一致。无图时按上下文语义尽力重建。en 仍逐字拷贝文字层原文(不得按图改写,定位依赖它)。图片仅供理解当前 <page> 文本;图片中超出 <page> 文本范围的内容(页内更后面的正文)一律不译、不得作为额外句子出现在 sentences 输出里。',
 ].join('\n');
 
 function json(status: number, body: unknown) {
@@ -162,14 +162,19 @@ Deno.serve(async (req: Request) => {
   try {
     parsed = JSON.parse(content);
   } catch {
-    // 偶发:模型在 JSON 外裹了文字,尝试抽取首个 {...}
+    // 偶发 1:模型在 JSON 外裹了文字,尝试抽取首个 {...}
+    // 偶发 2:模型在字符串字面量里输出裸控制字符(实测 ,来自公式字形映射的乱码),
+    //        JSON.parse 抛 "Bad control character" —— 对字符串字面量内的 \x00-\x1F 转义成 \uXXXX 再解析,
+    //        否则该页翻译直接 504/502 三次重试全废(DiLA p17 实测 2/2 复现)。
     const m = content.match(/\{[\s\S]*\}/);
-    if (m) {
-      try {
-        parsed = JSON.parse(m[0]);
-      } catch {
-        parsed = null;
-      }
+    const cand = (m ? m[0] : content).replace(
+      /"(?:[^"\\]|\\.)*"/g,
+      (s) => s.replace(/[\x00-\x1F]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0')),
+    );
+    try {
+      parsed = JSON.parse(cand);
+    } catch {
+      parsed = null;
     }
   }
   const sentences = Array.isArray(parsed?.sentences) ? parsed.sentences : null;
