@@ -2743,7 +2743,7 @@ function toast(msg, ms) {
 
 // 缓存版本：拼进 source_hash（sha256(TR_CACHE_VERSION + text)）。空串=初始版，与既有缓存 sha256(text) 兼容；
 // 改 Edge Function 的 SYSTEM_PROMPT / DEEPSEEK_MODEL 时同步 bump（'v2'/'v3'...），旧缓存 hash 不符自动失效重译。
-const TR_CACHE_VERSION = 'eq3'; // bump: 跨页切断句结构性合并（frag 并入 <page> 首部 + en 前缀剥离，v2.1.10）——旧缓存跨页句 zh 只有后半截，重译才完整；v2.1.9 为 'eq2'（ci 分组匹配）
+const TR_CACHE_VERSION = 'eq4'; // bump: v2.1.11 跨页合并 prompt 图注场景强化 + 合并失败自动重试——eq3 缓存里有"续句并进图注末句"的污染页（sage p3 实测），重译才干净；v2.1.10 为 'eq3'（结构性合并）
 
 // 分块上限：2000 时 body 含 ctx 标记可达 2100+，偶发 546（p3 chunk1 2132 失败/p2 2118 成功，DeepSeek 响应波动），1500 更稳
 const TR_CHUNK_SIZE = 1500;
@@ -2848,6 +2848,7 @@ function trStripFragPairs(pairs, frag, pageText) {
     stripped++;
   });
   if (stripped) console.log('[tr] 跨页合并：剥离 ' + stripped + ' 对的 frag 前缀');
+  return stripped; // v2.1.11：0 = 合并失败（frag 独立成对/截半/续句并进图注），trCallProxy 据此重试
 }
 
 // 取某页 textLayer 全文（复用 textContentCache；无则 streamTextContent 聚合，iOS 兼容见 aggregateTextContentStream）
@@ -2982,9 +2983,15 @@ async function trCallProxy(text, opts) {
     if (i === chunks.length - 1 && nextCtx) body += '\n<ctx_next>' + nextCtx + '</ctx_next>';
     console.log('[tr] chunk ' + (i + 1) + '/' + chunks.length, 'len=' + body.length, i === 0 && image ? '+img' : '');
     let pairs;
-    try { pairs = await trCallProxySingle(i === 0 ? { text: body, image } : { text: body }); }
-    catch (e) { console.log('[tr] chunk ' + (i + 1) + ' 失败:', e.message); throw e; }
-    if (Array.isArray(pairs)) {
+    // v2.1.11：首块带 cutFrag 时，若响应里没有任何 pair 成功剥出 frag 前缀 = 合并失败
+    // （frag 独立成对 / 截半 / 续句并进图注末句三种形态的统一信号），重发整个 chunk 最多 2 次——
+    // 温度 0.3 天然有方差（真 API 实测单次成功率 ~95%，3 次内 >99.9%）；重试响应整体替换，
+    // 并进图注的污染译文一并被干净响应换掉。仍失败保持现状优雅降级（frag 对定位失败被丢弃，如实反映）。
+    for (let attempt = 0; ; attempt++) {
+      if (rs && rs.tr && (rs.tr.cancelled || !rs.tr.enabled)) throw new Error('已取消');
+      try { pairs = await trCallProxySingle(i === 0 ? { text: body, image } : { text: body }); }
+      catch (e) { console.log('[tr] chunk ' + (i + 1) + ' 失败:', e.message); throw e; }
+      if (!Array.isArray(pairs)) break;
       // v2.1.4 ctx 泄漏过滤：对 chunk 正文 fold 串做单调顺序匹配（与 trApplyPage 同构）——
       // 正文流内按序找到 = 真句；不在流内且在 ctx 串里 = 泄漏对，丢（短标签如 "abstract" 恰是正文字串，
       // 单靠"正文含"判据残留；顺序判据下它排在正文流末尾之后，不误留）。漂移/乱序/跨块句两边都不中，照旧计入。
@@ -3009,7 +3016,17 @@ async function trCallProxy(text, opts) {
         return true;                                             // 漂移/乱序/跨块：留，匹配失败如实反映
       });
       if (pairs.length !== before) console.log('[tr] chunk ' + (i + 1) + ' 过滤 ctx 泄漏对 ' + (before - pairs.length) + ' 个');
-      if (i === 0 && cutFrag) trStripFragPairs(pairs, cutFrag, text); // v2.1.10：剥 en 的 frag/页眉前缀（zh 完整句不动）
+      let fragOk = true;
+      if (i === 0 && cutFrag) {
+        fragOk = trStripFragPairs(pairs, cutFrag, text) > 0; // v2.1.10：剥 en 的 frag/页眉前缀（zh 完整句不动）
+        if (!fragOk && attempt < 2) {
+          console.log('[tr] 跨页合并未成，重试 chunk 1（第 ' + (attempt + 1) + ' 次）');
+          continue;
+        }
+      }
+      break;
+    }
+    if (Array.isArray(pairs)) {
       pairs.forEach((p) => { p.ci = i; }); // v2.1.9：来源 chunk 标，trApplyPage 按组匹配（图片泄漏对去重；随 pairs 一起进缓存）
       all.push(...pairs);
     }
