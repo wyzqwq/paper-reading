@@ -231,6 +231,10 @@
     transform-origin: 0% 0%;
     -webkit-user-select: text; user-select: text;
   }
+  /* v2.2 PDF 超链接层：DOM 顺序在 textLayer 之后（叠加其上），容器不吃事件、只有 <a> 接管点击——
+     不挡选词/点句/翻译弹层；夜间模式不反色（同高亮/译文层策略，只反 canvas）。 */
+  .linkLayer { position: absolute; inset: 0; pointer-events: none; }
+  .linkLayer a { position: absolute; pointer-events: auto; -webkit-tap-highlight-color: transparent; }
   /* 叶子 span：pdf.js v6.2.108 在 span inline style 设 left/top(百分比)/--font-height/--scale-x/font-family，
      宿主 CSS 提供 font-size:calc(var(--text-scale-factor)*var(--font-height)) 与 transform:scaleX(var(--scale-x))
      （官方 pdf_viewer.css 规则，见 .textLayer 变量链）。漏这两条则 fontSize 回退 16px、无 scaleX -> 选区错位。 */
@@ -283,9 +287,11 @@
   }
   .textLayer .tr-icon:hover, .textLayer .tr-icon.tr-icon-active { opacity: 1; }
   .textLayer .tr-icon svg { width: 100%; height: 100%; display: block; stroke: var(--accent); fill: none; stroke-width: 1.2; stroke-linejoin: round; }
-  /* 手机触屏：点句弹译文，隐藏句尾小图标（手指难点中 + 冗余），分流见 onReaderTrClick */
+  /* 手机触屏：点句弹译文，隐藏句尾小图标（手指难点中 + 冗余），分流见 onReaderTrClick；
+     v2.2 隐藏顶栏 +/− 缩放按钮（pinch 才是手机主力，按钮占顶栏位置），桌面保留 */
   @media (hover: none) and (pointer: coarse) {
     .textLayer .tr-icon { display: none; }
+    .reader-zoom { display: none; }
   }
   .reader-tr-popup {
     position: fixed; z-index: 60; max-width: 84vw;
@@ -2448,6 +2454,15 @@ async function layoutPages() {
     tlDiv.style.height = Math.round(vpCss.height) + 'px';
     div.appendChild(tlDiv);
     canvas._textLayerDiv = tlDiv;
+    // v2.2 链接层（§3.4 补）：textLayer 之后（叠加其上），容器 pointer-events:none 只有 <a> 接管；
+    // 实际链接在 renderPage 里懒渲染（缩放变了重建，见 buildLinkLayer）
+    const llDiv = document.createElement('div');
+    llDiv.className = 'linkLayer';
+    llDiv.style.width = Math.round(vpCss.width) + 'px';
+    llDiv.style.height = Math.round(vpCss.height) + 'px';
+    div.appendChild(llDiv);
+    canvas._linkLayerDiv = llDiv;
+    canvas._linkScale = 0;
     scrollEl.appendChild(div);
     rs.canvases.push(canvas);
   }
@@ -2488,6 +2503,70 @@ async function renderPage(canvas) {
     applyHighlights(canvas._pageNum);
     trApplyPage(canvas._pageNum); // v2：textLayer 重建后重铺译文叠层（缩放/懒渲染）
   }
+  // v2.2 链接层渲染（与 textLayer 同节奏：懒渲染 + 缩放变了重建）
+  if (canvas._linkScale !== cssScale) {
+    canvas._linkScale = cssScale; // 先置位：getAnnotations 异步返回前避免重复触发
+    buildLinkLayer(canvas, cssScale);
+  }
+}
+
+// v2.2 构建链接层：page.getAnnotations() 过滤 Link 注释，按注释矩形生成 <a>。
+// 外部链接（url）新标签页打开（iPhone PWA 里唤起 Safari）；内部链接（dest，引用/目录跳页）
+// 点击解析页码后滚动到目标页（进度条/页码经现有 scroll 监听自然联动）。
+// 手写轻量层不用 pdf.js AnnotationLayer 类：不依赖其 API 细节与整套官方 CSS，内部跳页复用本 app 滚动机制。
+async function buildLinkLayer(canvas, cssScale) {
+  const rs = readerState;
+  const page = canvas._page;
+  const div = canvas._linkLayerDiv;
+  if (!rs || !page || !div) return;
+  let annos;
+  try { annos = await page.getAnnotations(); } catch (e) { return; }
+  if (!Array.isArray(annos) || annos.length === 0) return;
+  if (canvas._linkScale !== cssScale) return; // 缩放又变了，本次结果作废（renderPage 会带新 scale 重建）
+  div.textContent = '';
+  const vp = page.getViewport({ scale: cssScale });
+  for (const a of annos) {
+    if (!a || a.subtype !== 'Link' || a.hidden || a.annotationFlags & 2 /* Invisible flag */) continue;
+    // a.rect = PDF 用户空间 [x1,y1,x2,y2]（左下原点）；v6 viewport 只有 convertToViewportPoint
+    // （convertToViewportRectangle 已删），两角各转一次再取包围盒
+    if (!Array.isArray(a.rect) || a.rect.length !== 4) continue;
+    const [ax, ay] = vp.convertToViewportPoint(a.rect[0], a.rect[1]);
+    const [bx, by] = vp.convertToViewportPoint(a.rect[2], a.rect[3]);
+    const x = Math.min(ax, bx), y = Math.min(ay, by);
+    const w = Math.abs(bx - ax), h = Math.abs(by - ay);
+    if (w < 1 || h < 1) continue;
+    const el = document.createElement('a');
+    el.style.left = x + 'px'; el.style.top = y + 'px'; el.style.width = w + 'px'; el.style.height = h + 'px';
+    if (a.url) {
+      el.href = a.url; el.target = '_blank'; el.rel = 'noopener noreferrer';
+    } else if (a.dest) {
+      el.href = '#'; // 可访问性/键盘焦点；点击被拦截改为页内跳转
+      el.addEventListener('click', (ev) => { ev.preventDefault(); readerGotoDest(a.dest); });
+    } else {
+      continue; // 命名动作（FirstPage/NextPage 等）不常见，忽略
+    }
+    div.appendChild(el);
+  }
+}
+
+// v2.2 内部链接跳页：dest（命名 string 或显式数组 [pageRef, {name:'XYZ',...}, ...]）→ 页码 → 滚动。
+// 目标页可能尚未渲染：scrollIntoView 会触发 IntersectionObserver 懒渲染，链接层/textLayer 到位后可点。
+async function readerGotoDest(dest) {
+  const rs = readerState;
+  if (!rs || !rs.pdf || !dest) return;
+  try {
+    let d = dest;
+    if (typeof d === 'string') d = await rs.pdf.getDestination(d); // 命名 dest → 显式数组
+    if (!Array.isArray(d)) return;
+    const ref = d[0];
+    let idx = -1;
+    if (ref && typeof ref === 'object') idx = await rs.pdf.getPageIndex(ref);
+    else if (typeof ref === 'number') idx = ref; // dest 内嵌页号（0 基）
+    if (idx < 0 || idx >= rs.canvases.length) return;
+    const target = rs.canvases[idx];
+    const pageEl = target && target.closest('.reader-page');
+    if (pageEl) pageEl.scrollIntoView({ block: 'start' });
+  } catch (e) { /* dest 解析失败（坏引用等）静默，等同无链接 */ }
 }
 
 // 聚合 streamTextContent 返回的 ReadableStream（M7）：iOS Safari 18.7 的 JavaScriptCore 不支持

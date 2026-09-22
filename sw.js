@@ -2,7 +2,7 @@
 // P0：waiting 模式（install 不 skipWaiting，等页面 postMessage SKIP_WAITING 才接管），
 // 配合"有新版本"横幅让用户决定何时刷新，不在阅读中途强制 reload 丢阅读现场。
 // P0：导航 network-first（总拿新版，离线回缓存）；资源 cache-first + res.ok 守卫。
-const CACHE = 'paper-reading-v39'; // v39: v2.1.11 跨页合并 prompt 图注场景强化 + 合并失败自动重试；TR_CACHE_VERSION bump eq4
+const CACHE = 'paper-reading-v40'; // v40: v2.2 阅读器 PDF 超链接层（外部新标签页/内部跳页）+ 手机隐藏 +/− 缩放按钮
 const SHELL = [
   './',
   './index.html',
