@@ -2822,7 +2822,7 @@ function toast(msg, ms) {
 
 // 缓存版本：拼进 source_hash（sha256(TR_CACHE_VERSION + text)）。空串=初始版，与既有缓存 sha256(text) 兼容；
 // 改 Edge Function 的 SYSTEM_PROMPT / DEEPSEEK_MODEL 时同步 bump（'v2'/'v3'...），旧缓存 hash 不符自动失效重译。
-const TR_CACHE_VERSION = 'eq4'; // bump: v2.1.11 跨页合并 prompt 图注场景强化 + 合并失败自动重试——eq3 缓存里有"续句并进图注末句"的污染页（sage p3 实测），重译才干净；v2.1.10 为 'eq3'（结构性合并）
+const TR_CACHE_VERSION = 'eq5'; // bump: v2.2.1 frag 提取剥页脚噪音行——eq4 缓存有印章污染合并页（kura p2 实测 frag="LG] 24 Jun 2026"），重译才干净；v2.1.11 为 'eq4'
 
 // 分块上限：2000 时 body 含 ctx 标记可达 2100+，偶发 546（p3 chunk1 2132 失败/p2 2118 成功，DeepSeek 响应波动），1500 更稳
 const TR_CHUNK_SIZE = 1500;
@@ -2877,6 +2877,16 @@ async function trGetCtx(pageNum, dir) {
 // "As shown in Fig." 前缀（DiLA p6→p7 实测踩坑）。
 function trSplitCutFrag(prevCtx) {
   if (!prevCtx) return { ctx: '', frag: '' };
+  // v2.2.1：先剥尾部页脚噪音行（独立页码 / arXiv 竖排印章整行 / 印章残段行）再找句末。
+  // 印章 "arXiv:2604.07904v2 [cs.LG] 24 Jun 2026" 里的 "[cs." 句点不在缩写白名单，会被
+  // 当成句末 → frag 误切成印章残片 "LG] 24 Jun 2026"、真切断句挤丢（kura p1→p2 实测）。
+  // 循环剥（页码+印章可能多行叠在尾部）；只影响 frag/ctx 提取，不影响翻译正文。
+  const NOISE_LINE = '\\d{1,3}|arXiv:\\d{4}\\.\\d{4,5}(?:v\\d+)?\\s*\\[[^\\]]+\\][^\\n]*|[A-Za-z]{1,4}\\]\\s*\\d{1,2}\\s+[A-Za-z]{3}\\s+\\d{4}';
+  for (;;) {
+    const next = prevCtx.replace(new RegExp('\\s*\\n\\s*(?:' + NOISE_LINE + ')\\s*$'), '');
+    if (next === prevCtx) break;
+    prevCtx = next;
+  }
   let bi = -1;
   for (let i = prevCtx.length - 1; i >= 0; i--) {
     const ch = prevCtx[i];
