@@ -2,7 +2,7 @@
 // P0：waiting 模式（install 不 skipWaiting，等页面 postMessage SKIP_WAITING 才接管），
 // 配合"有新版本"横幅让用户决定何时刷新，不在阅读中途强制 reload 丢阅读现场。
 // P0：导航 network-first（总拿新版，离线回缓存）；资源 cache-first + res.ok 守卫。
-const CACHE = 'paper-reading-v41'; // v41: v2.2.1 trSplitCutFrag 剥页脚噪音行（页码/arXiv 印章），修跨页合并 frag 误切
+const CACHE = 'paper-reading-v42'; // v42: v2.2.2 连字符断词词典定位续句插入（修 kura p4→p5 图表页跨页句续句丢失）
 const SHELL = [
   './',
   './index.html',

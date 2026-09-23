@@ -2822,7 +2822,7 @@ function toast(msg, ms) {
 
 // 缓存版本：拼进 source_hash（sha256(TR_CACHE_VERSION + text)）。空串=初始版，与既有缓存 sha256(text) 兼容；
 // 改 Edge Function 的 SYSTEM_PROMPT / DEEPSEEK_MODEL 时同步 bump（'v2'/'v3'...），旧缓存 hash 不符自动失效重译。
-const TR_CACHE_VERSION = 'eq5'; // bump: v2.2.1 frag 提取剥页脚噪音行——eq4 缓存有印章污染合并页（kura p2 实测 frag="LG] 24 Jun 2026"），重译才干净；v2.1.11 为 'eq4'
+const TR_CACHE_VERSION = 'eq6'; // bump: v2.2.2 断词定位续句插入（frag 插到续句行前，kura p4→p5 图表场景）——eq5 缓存里该形态页续句翻译丢失，重译才干净；v2.2.1 为 'eq5'
 
 // 分块上限：2000 时 body 含 ctx 标记可达 2100+，偶发 546（p3 chunk1 2132 失败/p2 2118 成功，DeepSeek 响应波动），1500 更稳
 const TR_CHUNK_SIZE = 1500;
@@ -2903,6 +2903,31 @@ function trSplitCutFrag(prevCtx) {
   ctx = ctx.trim();
   if (frag.length < 4 || !/[A-Za-z]/.test(frag)) return { ctx: prevCtx, frag: '' };
   return { ctx, frag };
+}
+
+// v2.2.2 连字符断词定位续句：frag 以 "[字母]-" 结尾（跨页断词，如 "computation effi-"）时，
+// 续句行必以补完该词的小写字母开头（"ciency as well…"）。用内置 ECDICT（查词的内存 dictMap）
+// 验证 frag 尾词 + 行首 token 拼成真词（"effi"+"ciency"="efficiency"）= 强定位信号。
+// 页顶图表把续句推到页中时（kura p4→p5：frag 与续句间隔 ~1500 字符轴标签垃圾 + 两段图注），
+// 头部并入模型搭不了桥（实测续句被吸进图表垃圾对、翻译丢失）；frag 插到续句行紧前，模型看到
+// "effi-\nciency" 连字符换行的完整句自然合并（真 API 3/3）。逐行扫描首个命中；行 0 跳过
+// （续句就在页首时头部并入已覆盖）；找不到（非断词切断 / 词典未收的技术词 / 复合词）返回 null
+// 回退 v2.1.10 头部并入。dictMap 由 dictEnsureLoaded 预载（app 打开即拉），null 时同样回退。
+function trMergeFragIntoText(text, frag) {
+  try {
+    const m = /([A-Za-z]+)-\s*$/.exec(frag.trim());
+    if (!m || m[1].length < 2 || !dictMap) return null;
+    const tail = m[1].toLowerCase();
+    const lines = text.split('\n');
+    for (let i = 1; i < lines.length; i++) {
+      const tk = /^[a-z]+/.exec(lines[i].trim());
+      if (tk && dictMap.has(tail + tk[0])) {
+        console.log('[tr] 断词定位：frag 插到第 ' + (i + 1) + ' 行前（' + tail + '+' + tk[0] + ' 命中词典）');
+        return lines.slice(0, i).join('\n') + '\n' + frag.trim() + '\n' + lines.slice(i).join('\n');
+      }
+    }
+  } catch (e) { console.log('[tr] 断词定位失败，回退头部并入:', (e && e.message) || e); }
+  return null;
 }
 
 // v2.1.10 前缀剥离：en 的非空白字符按序累积，恰好耗尽 frag 的非空白串即 frag 前缀结束，返回剩余
@@ -3059,14 +3084,24 @@ async function trCallProxy(text, opts) {
   const nextCtx = opts && opts.nextCtx;
   const image = (opts && opts.image) || '';
   const cutFrag = (opts && opts.cutFrag) || '';
+  // v2.2.2：断词定位时 frag 已由 trMergeFragIntoText 插进 text（页中某处），不再头部并入
+  const fragMerged = !!(opts && opts.fragMerged);
   const chunks = trSplitText(text, TR_CHUNK_SIZE);
   if (chunks.length === 0) return [];
+  // v2.2.2：frag 所在块——fragMerged 时 frag 在页中（图垃圾把它推到第 2+ 块），剥离/重试跟着这一块走
+  let fragChunk = 0;
+  if (fragMerged && cutFrag) {
+    const fw = cutFrag.replace(/\s+/g, '');
+    const fi = chunks.findIndex((c) => c.replace(/\s+/g, '').indexOf(fw) >= 0);
+    if (fi >= 0) fragChunk = fi;
+  }
   const all = [];
   for (let i = 0; i < chunks.length; i++) {
     if (rs && rs.tr && (rs.tr.cancelled || !rs.tr.enabled)) throw new Error('已取消');
     // v2.1.10：上页切断句开头并入首块（单 \n 同段，避免被 trSplitText 当独立段落拆成单独 chunk）
+    // v2.2.2：fragMerged 时 frag 已在文本里，跳过头部并入
     let ct = chunks[i];
-    if (i === 0 && cutFrag) ct = cutFrag + '\n' + ct;
+    if (i === 0 && cutFrag && !fragMerged) ct = cutFrag + '\n' + ct;
     let body = '<page>' + ct + '</page>';
     if (i === 0 && prevCtx) body = '<ctx_prev>' + prevCtx + '</ctx_prev>\n' + body;
     if (i === chunks.length - 1 && nextCtx) body += '\n<ctx_next>' + nextCtx + '</ctx_next>';
@@ -3106,10 +3141,10 @@ async function trCallProxy(text, opts) {
       });
       if (pairs.length !== before) console.log('[tr] chunk ' + (i + 1) + ' 过滤 ctx 泄漏对 ' + (before - pairs.length) + ' 个');
       let fragOk = true;
-      if (i === 0 && cutFrag) {
-        fragOk = trStripFragPairs(pairs, cutFrag, text) > 0; // v2.1.10：剥 en 的 frag/页眉前缀（zh 完整句不动）
+      if (i === fragChunk && cutFrag) {
+        fragOk = trStripFragPairs(pairs, cutFrag, text) > 0; // v2.1.10：剥 en 的 frag/页眉前缀（zh 完整句不动）；v2.2.2 改跟着 frag 所在块
         if (!fragOk && attempt < 2) {
-          console.log('[tr] 跨页合并未成，重试 chunk 1（第 ' + (attempt + 1) + ' 次）');
+          console.log('[tr] 跨页合并未成，重试 chunk ' + (fragChunk + 1) + '（第 ' + (attempt + 1) + ' 次）');
           continue;
         }
       }
@@ -3184,9 +3219,15 @@ async function trEnsurePairs(pageNum) {
   // v2.1.10：前页末尾被切断的句子，开头（frag）并入本页 <page> 首部结构性合并（见 trCallProxy）
   const prevRaw = pageNum > 1 ? await trGetCtx(pageNum - 1, 'tail') : '';
   const cut = trSplitCutFrag(prevRaw);
+  // v2.2.2：断词切断（frag 以 "[字母]-" 结尾）优先词典定位续句行插入（页顶图表场景）；否则回退头部并入
+  let trText = text, fragMerged = false;
+  if (cut.frag) {
+    const mt = trMergeFragIntoText(text, cut.frag);
+    if (mt) { trText = mt; fragMerged = true; }
+  }
   const nextCtx = pageNum < rs.numPages ? await trGetCtx(pageNum + 1, 'head') : '';
   const image = await trRenderPageImage(pageNum); // v2.1.1：每页都传图（上标丢失文本侧不可检测）
-  const pairs = await trCallProxy(text, { prevCtx: cut.ctx, cutFrag: cut.frag, nextCtx, image });
+  const pairs = await trCallProxy(trText, { prevCtx: cut.ctx, cutFrag: cut.frag, fragMerged, nextCtx, image });
   console.log('[tr] p' + pageNum, '代理返回 pairs=' + (pairs ? pairs.length : 'null'));
   if (!rs.tr || rs.tr.cancelled) return null; // 调用期间被取消
   await dbPutTranslation({ id: (cached && cached.id) || uid(), user_id: userId, paper_id: paperId, page_num: pageNum, pairs, source_hash: hash });
@@ -3211,10 +3252,15 @@ async function trRetranslatePage(pageNum) {
   let pairs = [];
   if (text.trim()) {
     const prevRaw = pageNum > 1 ? await trGetCtx(pageNum - 1, 'tail') : '';
-    const cut = trSplitCutFrag(prevRaw); // v2.1.10：跨页切断句开头并入 <page> 首部
+    const cut = trSplitCutFrag(prevRaw); // v2.1.10：跨页切断句开头并入 <page>（v2.2.2 断词时定位续句行插入）
+    let trText = text, fragMerged = false;
+    if (cut.frag) {
+      const mt = trMergeFragIntoText(text, cut.frag);
+      if (mt) { trText = mt; fragMerged = true; }
+    }
     const nextCtx = pageNum < rs.numPages ? await trGetCtx(pageNum + 1, 'head') : '';
     const image = await trRenderPageImage(pageNum); // v2.1.1：每页都传图（上标丢失文本侧不可检测）
-    try { pairs = await trCallProxy(text, { prevCtx: cut.ctx, cutFrag: cut.frag, nextCtx, image }); }
+    try { pairs = await trCallProxy(trText, { prevCtx: cut.ctx, cutFrag: cut.frag, fragMerged, nextCtx, image }); }
     catch (e) { trApplyError('重译失败：' + ((e && e.message) || e)); tr.pages[pageNum].status = 'error'; trRenderStatus(); return; }
     if (!rs.tr || rs.tr.cancelled) return;
   }
