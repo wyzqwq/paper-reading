@@ -2822,7 +2822,7 @@ function toast(msg, ms) {
 
 // 缓存版本：拼进 source_hash（sha256(TR_CACHE_VERSION + text)）。空串=初始版，与既有缓存 sha256(text) 兼容；
 // 改 Edge Function 的 SYSTEM_PROMPT / DEEPSEEK_MODEL 时同步 bump（'v2'/'v3'...），旧缓存 hash 不符自动失效重译。
-const TR_CACHE_VERSION = 'eq6'; // bump: v2.2.2 断词定位续句插入（frag 插到续句行前，kura p4→p5 图表场景）——eq5 缓存里该形态页续句翻译丢失，重译才干净；v2.2.1 为 'eq5'
+const TR_CACHE_VERSION = 'eq7'; // bump: v2.2.4 公式编号结尾 where 续句定位（frag 插到 where 行前，kura p2→p3 图注粘连场景）——eq6 缓存里该形态页图注+续句粘连，重译才分开；v2.2.2 为 'eq6'
 
 // 分块上限：2000 时 body 含 ctx 标记可达 2100+，偶发 546（p3 chunk1 2132 失败/p2 2118 成功，DeepSeek 响应波动），1500 更稳
 const TR_CHUNK_SIZE = 1500;
@@ -2913,17 +2913,31 @@ function trSplitCutFrag(prevCtx) {
 // "effi-\nciency" 连字符换行的完整句自然合并（真 API 3/3）。逐行扫描首个命中；行 0 跳过
 // （续句就在页首时头部并入已覆盖）；找不到（非断词切断 / 词典未收的技术词 / 复合词）返回 null
 // 回退 v2.1.10 头部并入。dictMap 由 dictEnsureLoaded 预载（app 打开即拉），null 时同样回退。
+// v2.2.4 加第二定位信号：frag 以公式编号 "(4)" 结尾时扫首个 where 续句行插入其前（公式块跨页切断场景，详见函数体内注释）。
 function trMergeFragIntoText(text, frag) {
   try {
     const m = /([A-Za-z]+)-\s*$/.exec(frag.trim());
-    if (!m || m[1].length < 2 || !dictMap) return null;
-    const tail = m[1].toLowerCase();
-    const lines = text.split('\n');
-    for (let i = 1; i < lines.length; i++) {
-      const tk = /^[a-z]+/.exec(lines[i].trim());
-      if (tk && dictMap.has(tail + tk[0])) {
-        console.log('[tr] 断词定位：frag 插到第 ' + (i + 1) + ' 行前（' + tail + '+' + tk[0] + ' 命中词典）');
-        return lines.slice(0, i).join('\n') + '\n' + frag.trim() + '\n' + lines.slice(i).join('\n');
+    if (m && m[1].length >= 2 && dictMap) {
+      const tail = m[1].toLowerCase();
+      const lines = text.split('\n');
+      for (let i = 1; i < lines.length; i++) {
+        const tk = /^[a-z]+/.exec(lines[i].trim());
+        if (tk && dictMap.has(tail + tk[0])) {
+          console.log('[tr] 断词定位：frag 插到第 ' + (i + 1) + ' 行前（' + tail + '+' + tk[0] + ' 命中词典）');
+          return lines.slice(0, i).join('\n') + '\n' + frag.trim() + '\n' + lines.slice(i).join('\n');
+        }
+      }
+    }
+    // v2.2.4 分支：公式编号结尾 + where 续句。frag 以 "…(4)" 结尾（公式块被跨页切断）时，
+    // 学术惯例续句以小写 where 开头（"…(4) where MHSA is…"）——扫首个 where 行插入其紧前。
+    // 头部并此时续句隔着整图+图注，模型接不上 frag 就把小写 where 向前并进图注末句
+    // （kura p2→p3 实测 4/6 粘连）。找不到 where 行返回 null 回退头部并入。
+    if (/\(\s*\d+\s*\)\s*$/.test(frag.trim())) {
+      const lines = text.split('\n');
+      const wi = lines.findIndex((ln) => /^where\b/.test(ln.trim()));
+      if (wi > 0) {
+        console.log('[tr] 公式续句定位：frag 插到第 ' + (wi + 1) + ' 行前（where 续句）');
+        return lines.slice(0, wi).join('\n') + '\n' + frag.trim() + '\n' + lines.slice(wi).join('\n');
       }
     }
   } catch (e) { console.log('[tr] 断词定位失败，回退头部并入:', (e && e.message) || e); }
