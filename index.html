@@ -4308,9 +4308,29 @@ if ('serviceWorker' in navigator) {
       refresh.textContent = '刷新';
       refresh.style.cssText = 'text-decoration:underline;cursor:pointer';
       refresh.addEventListener('click', () => {
+        // 点击反馈：文字变"更新中…"，防重复点击
+        refresh.textContent = '更新中…';
+        refresh.style.pointerEvents = 'none';
+        // 看门狗：postMessage 后 2s 仍未 controllerchange（activate 卡住等罕见态）手动 reload，
+        // 别让横幅无声卡死（v2.2.3）
+        let fired = false;
+        const watchdog = setTimeout(() => { if (!fired) { fired = true; doUpdateReload(); } }, 2000);
+        const onChange = () => {
+          // 回声窗口内的 controllerchange 会被主监听器忽略，也别取消看门狗——让它兜底 reload
+          if (swReloadedAt && Date.now() - swReloadedAt < 10000) return;
+          fired = true; clearTimeout(watchdog);
+        };
+        navigator.serviceWorker.addEventListener('controllerchange', onChange, { once: true });
         // 通知 waiting 的 SW 接管；controllerchange 时再 reload（见下）
         navigator.serviceWorker.getRegistration().then((reg) => {
-          if (reg && reg.waiting) reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+          if (reg && reg.waiting) {
+            reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+          } else {
+            // v2.2.3 兜底：无 waiting（新 SW 已接管/状态丢失，如防循环门闩卡过的横幅）——直接 reload 拿新页面
+            clearTimeout(watchdog);
+            navigator.serviceWorker.removeEventListener('controllerchange', onChange);
+            doUpdateReload();
+          }
         });
       });
       const close = document.createElement('span');
@@ -4324,15 +4344,18 @@ if ('serviceWorker' in navigator) {
     }
     b.style.display = 'flex';
   };
-  // 防循环：本次页面若是 controllerchange reload 的结果，不再自动 reload（避免 SW 异常状态导致 reload 死循环"一直刷新"）
-  const swReloaded = sessionStorage.getItem('sw-reloaded');
-  if (swReloaded) sessionStorage.removeItem('sw-reloaded');
-  // controllerchange：用户点"刷新" -> SKIP_WAITING -> 新 SW 接管 -> reload
-  navigator.serviceWorker.addEventListener('controllerchange', () => {
+  // 防循环：本次页面若是 controllerchange reload 的结果，10 秒内的 controllerchange 视为"回声"忽略
+  // （防 SW 异常状态导致 reload 死循环"一直刷新"）。v2.2.3：原实现是页面级布尔门闩（swReloaded 读一次、
+  // 整个页面生命周期为真）——同会话第二次 SW 更新时 controllerchange 被永久拦截，新 SW 已 claim 但页面
+  // 不 reload、横幅卡死点不动（v38→v42 连发 + PWA 挂后台不关的实测场景）。改时间窗：reload 后 10s 内
+  // 忽略，之后的 controllerchange 正常放行。
+  const swReloadedAt = Number(sessionStorage.getItem('sw-reloaded-at')) || 0;
+  if (swReloadedAt) sessionStorage.removeItem('sw-reloaded-at');
+  // 更新 reload（保存阅读现场 + 防回声标记 + reload），controllerchange 与看门狗共用
+  const doUpdateReload = () => {
     if (refreshing) return;
-    if (swReloaded) return; // 刚 reload 过的页面不再自动 reload（防循环）
     refreshing = true;
-    sessionStorage.setItem('sw-reloaded', '1');
+    sessionStorage.setItem('sw-reloaded-at', String(Date.now()));
     // 存阅读现场：reload 后自动回到原论文（restoreReaderProgress 恢复页位），避免 SW 更新 reload 退出阅读器丢现场
     try {
       if (typeof readerState !== 'undefined' && readerState && readerState.paper && readerState.paper.id) {
@@ -4340,6 +4363,12 @@ if ('serviceWorker' in navigator) {
       }
     } catch (e) { /* sessionStorage 不可用时忽略 */ }
     location.reload();
+  };
+  // controllerchange：用户点"刷新" -> SKIP_WAITING -> 新 SW 接管 -> reload
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (refreshing) return;
+    if (swReloadedAt && Date.now() - swReloadedAt < 10000) return; // 刚 reload 完 10s 内的回声，不 reload（防循环）
+    doUpdateReload();
   });
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('sw.js').then((reg) => {
