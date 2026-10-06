@@ -2378,6 +2378,12 @@ async function openReader(paper, jumpPage) {
   };
   trRenderStatus(); // 新 readerState.tr=null，清状态栏旧译文进度（bug1）
 
+  // P2 加载进度 + 卡死检测（2026-09-29）：arXiv 线路偶发停滞（连接在、字节不来），
+  // 此前无限转圈——无报错、无重试入口（用户实测卡 10 分钟后自愈）。进度显示让「慢」与
+  // 「卡死」可分辨；30 秒无新字节判停滞：销毁任务 + 报错 + 重试按钮。仅在线加载（url）
+  // 启用；本地 IDB/Storage 读不需要（同步快路径，卡死另有 catch 兜底报错）。
+  let stalled = false;
+  let stallTimer = 0;
   try {
     const task = pdfjsLib.getDocument({
       ...docInit,
@@ -2385,7 +2391,28 @@ async function openReader(paper, jumpPage) {
       standardFontDataUrl: './vendor/pdfjs/standard_fonts/'
     });
     readerState.loadingTask = task;
+    if (url) {
+      task.onProgress = (ev) => {
+        lastProgressAt = Date.now();
+        const loadEl = scrollEl.querySelector('.reader-loading');
+        if (!loadEl) return;
+        const mb = (n) => ((n || 0) / 1048576).toFixed(1) + ' MB';
+        loadEl.textContent = ev && ev.total ? ('加载中… ' + mb(ev.loaded) + ' / ' + mb(ev.total)) : ('加载中… ' + mb(ev.loaded));
+      };
+      let lastProgressAt = Date.now(); // 此前从未有 progress 事件也算停滞（连接建立但一字节不来）
+      stallTimer = setInterval(() => {
+        if (!readerState || readerState.loadingTask !== task) { clearInterval(stallTimer); return; }
+        if (Date.now() - lastProgressAt <= 30000) return;
+        stalled = true;
+        clearInterval(stallTimer);
+        try { task.destroy(); } catch (e) { /* 已终止则忽略 */ }
+        scrollEl.innerHTML = '<div class="reader-error">加载停滞（30 秒无新数据）：可能是到 arXiv 的网络线路不通。<br>稍后重试，或用条目的「缓存」按钮先存到本地再读。<br><button class="btn-secondary" id="reader-retry-btn">重试</button></div>';
+        const rb = document.getElementById('reader-retry-btn');
+        if (rb) rb.addEventListener('click', () => openReader(p, jumpPage));
+      }, 3000);
+    }
     const pdf = await task.promise;
+    if (stallTimer) clearInterval(stallTimer);
     readerState.pdf = pdf;
     readerState.numPages = pdf.numPages;
     // 拉该论文已有高亮批注（M4）
@@ -2411,6 +2438,7 @@ async function openReader(paper, jumpPage) {
     scrollEl.addEventListener('touchmove', onReaderTouchMove, { passive: true });
     scrollEl.addEventListener('touchend', onReaderTouchEnd, { passive: true });
   } catch (e) {
+    if (stalled) return; // 停滞路径已显示带重试按钮的提示（task.destroy 的拒绝不覆盖它）
     scrollEl.innerHTML = '<div class="reader-error">PDF 加载失败：' +
       escapeHtml(e && e.message || String(e)) +
       '<br>可能文件损坏、网络问题或跨域限制。</div>';
