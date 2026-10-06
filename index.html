@@ -2247,12 +2247,20 @@ async function downloadPaperPdf(p) {
       if (!file || !file.data) { toast('本地与云端均无 PDF 文件'); return; }
       blob = new Blob([file.data], { type: 'application/pdf' });
     } else {
-      const url = resolvePdfUrl(p);
-      if (!url) { toast('该条目没有可下载的 PDF 链接'); return; }
-      const r = await fetch(url);
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      blob = await r.blob();
-      if (!blob || blob.size === 0) throw new Error('空文件');
+      // v2.2.6 缓存优先（与 openReader 对齐）：「缓存」按钮存的 IDB 命中直接本地出（瞬间完成），
+      // 未命中才在线 fetch——否则缓存过的条目下载仍走网络，用户以为缓存没生效
+      let cached = null;
+      try { cached = await dbGetFile(p.id); } catch (e) { /* 查不到当未缓存 */ }
+      if (cached && cached.data) {
+        blob = new Blob([cached.data], { type: 'application/pdf' });
+      } else {
+        const url = resolvePdfUrl(p);
+        if (!url) { toast('该条目没有可下载的 PDF 链接'); return; }
+        const r = await fetch(url);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        blob = await r.blob();
+        if (!blob || blob.size === 0) throw new Error('空文件');
+      }
     }
     const name = pdfFileName(p.title);
     const fileObj = new File([blob], name, { type: 'application/pdf' });
