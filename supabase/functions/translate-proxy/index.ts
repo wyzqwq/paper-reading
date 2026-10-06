@@ -163,19 +163,31 @@ Deno.serve(async (req: Request) => {
     parsed = JSON.parse(content);
   } catch {
     // 偶发 1:模型在 JSON 外裹了文字,尝试抽取首个 {...}
-    // 偶发 2:模型在字符串字面量里输出裸控制字符(实测 ,来自公式字形映射的乱码),
-    //        JSON.parse 抛 "Bad control character" —— 对字符串字面量内的 \x00-\x1F 转义成 \uXXXX 再解析,
-    //        否则该页翻译直接 504/502 三次重试全废(DiLA p17 实测 2/2 复现)。
+    // 偶发 2:裸控制字符(公式字形映射乱码) -> "Bad control character"(v2.1.10,DiLA p17)
+    // 偶发 3:非法转义序列 —— 模型重建 LaTeX 时输出 "\{" 类(合法 JSON 只允许 \" \\ \/ \b \f \n \r \t \uXXXX),
+    //        "\{" 抛 "Bad escaped character")(v2.2.7,FLA p14 zh 含 "$S_K$ 是 $\\{1, \\ldots, K\\}$" 真响应 3/3 必现,
+    //        该页 502 三次重试全废,表现为"一直翻译不出来")。
+    // 单趟状态机扫描器统一修两类,对候选整串跑(JSON 结构区无反斜杠,越界无害):
+    //   合法转义(含 \uXXXX)整段原样过;非法转义反斜杠加倍(合法的 "\\{" = 转义反斜杠+花括号不误伤——
+    //   正则逐反斜杠判断会把它拆坏,实测 regex 版 FAIL / 扫描器 OK);裸控制字符转 \uXXXX。
     const m = content.match(/\{[\s\S]*\}/);
-    const cand = (m ? m[0] : content).replace(
-      /"(?:[^"\\]|\\.)*"/g,
-      (s) => s.replace(/[\x00-\x1F]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0')),
-    );
-    try {
-      parsed = JSON.parse(cand);
-    } catch {
-      parsed = null;
+    const cand = m ? m[0] : content;
+    let fixed = '';
+    for (let i = 0; i < cand.length; i++) {
+      const c = cand[i];
+      if (c === '\\') {
+        const n = cand[i + 1];
+        if (n === undefined) { fixed += '\\\\'; break; }
+        if ('"\\/bfnrt'.includes(n)) { fixed += c + n; i++; continue; }
+        if (n === 'u' && /^[0-9a-fA-F]{4}$/.test(cand.slice(i + 2, i + 6))) { fixed += c + n + cand.slice(i + 2, i + 6); i += 5; continue; }
+        fixed += '\\\\';
+        continue;
+      }
+      const code = c.charCodeAt(0);
+      if (code < 0x20) { fixed += '\\u' + code.toString(16).padStart(4, '0'); continue; }
+      fixed += c;
     }
+    try { parsed = JSON.parse(fixed); } catch { parsed = null; }
   }
   const sentences = Array.isArray(parsed?.sentences) ? parsed.sentences : null;
   if (!sentences) return json(502, { error: 'DeepSeek 返回无 sentences 字段' });
