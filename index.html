@@ -3001,12 +3001,15 @@ function trMergeFragIntoText(text, frag) {
           if (!ln) continue;
           if (inCap) { if (/[.!?]$/.test(ln)) inCap = false; prev = ln; continue; }
           if (CAP_START.test(ln)) { if (/[.!?]$/.test(ln)) inCap = false; else inCap = true; prev = ln; continue; }
-          if (/^[a-z]/.test(ln) && ln.length >= 15) {
+          if (/^[a-z]/.test(ln) && ln.length >= 15 && !/\s=\s/.test(ln)) {
             // v2.2.8.1 前行标点校验：真续句的上一个非空行要么以 .!? 收尾（正文句/图注块已结束），
             // 要么是页首页眉行且不含句读（dila p7 页眉 "Disentangled Latent Action World Models" 后即真续句）。
             // 多分部图注「(A)…(B)…(C)」中段就断句、后续图注行又小写长行开头（sage p3 "(B)" 部的
             // "zt operates…"）会被前者拒掉；图内标签串（fla p14 "trajectory"/"controlledoriginal"——
             // 小写且无标点）因前行非页眉被拒，扫描继续找真续句。
+            // v2.2.8.2 等号拒选：伪代码/公式行的强特征是含赋值等号（fla p5 Algorithm 1 的
+            // "for slot i = 1, . . . do"——前行 "Factorizer(z1:T )." 句点结尾骗过前行校验当选，
+            // frag 被插进伪代码块、真 API 3/3 与伪代码行粘连）；真续句（散文行）不含 " = "。
             if (/[.!?]$/.test(prev) || (i === 1 && !/[.!?]/.test(prev))) { found = i; break; }
             prev = ln; continue; // 疑似图注中段/标签行：不当候选，继续扫
           }
