@@ -2,7 +2,7 @@
 // P0：waiting 模式（install 不 skipWaiting，等页面 postMessage SKIP_WAITING 才接管），
 // 配合"有新版本"横幅让用户决定何时刷新，不在阅读中途强制 reload 丢阅读现场。
 // P0：导航 network-first（总拿新版，离线回缓存）；资源 cache-first + res.ok 守卫。
-const CACHE = 'paper-reading-v43'; // v43: v2.2.4 公式编号结尾 where 续句定位（修 kura p2→p3 图注+续句粘连）
+const CACHE = 'paper-reading-v44'; // v44: v2.2.8 通用续句定位（修 fla p3→p4 图注+续句粘连）
 const SHELL = [
   './',
   './index.html',

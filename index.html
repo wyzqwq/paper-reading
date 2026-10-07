@@ -2858,7 +2858,7 @@ function toast(msg, ms) {
 
 // 缓存版本：拼进 source_hash（sha256(TR_CACHE_VERSION + text)）。空串=初始版，与既有缓存 sha256(text) 兼容；
 // 改 Edge Function 的 SYSTEM_PROMPT / DEEPSEEK_MODEL 时同步 bump（'v2'/'v3'...），旧缓存 hash 不符自动失效重译。
-const TR_CACHE_VERSION = 'eq7'; // bump: v2.2.4 公式编号结尾 where 续句定位（frag 插到 where 行前，kura p2→p3 图注粘连场景）——eq6 缓存里该形态页图注+续句粘连，重译才分开；v2.2.2 为 'eq6'
+const TR_CACHE_VERSION = 'eq8'; // bump: v2.2.8 通用续句定位（句中切断 frag + 跳图注块找首个小写长行，fla p3→p4 图注粘连场景）——eq7 缓存里该形态页图注+续句粘连，重译才分开；v2.2.4 为 'eq7'
 
 // 分块上限：2000 时 body 含 ctx 标记可达 2100+，偶发 546（p3 chunk1 2132 失败/p2 2118 成功，DeepSeek 响应波动），1500 更稳
 const TR_CHUNK_SIZE = 1500;
@@ -2974,6 +2974,41 @@ function trMergeFragIntoText(text, frag) {
       if (wi > 0) {
         console.log('[tr] 公式续句定位：frag 插到第 ' + (wi + 1) + ' 行前（where 续句）');
         return lines.slice(0, wi).join('\n') + '\n' + frag.trim() + '\n' + lines.slice(wi).join('\n');
+      }
+    }
+    // v2.2.8 通用分支：无断词/公式编号信号的普通句中切断（frag 不以终结标点 . ! ? : ; 结尾），
+    // 续句在页顶图表+图注之后的场景（fla p3→p4：frag "K slots st ∈ RK×ds"，续句 "are initialized…"
+    // 隔图 3 + 图注，头部并 3/5 粘图注）。定位：逐行扫，图注块整体跳过（Figure N./Table N. 开头行起，
+    // 到首个以 .!? 结尾的行止——fla 图注第二行 "latent actions and makes…" 小写开头但块内，正确排除）；
+    // 块外首个「小写开头且 ≥15 字符」行为候选（图内标签 "Encoder"/"(a) (b)" 短/非小写，不误中），插其紧前。
+    // 页首守卫：页第 0 行已小写开头 = 续句在页首，头部并入已相邻，不重定位。首个候选万一非真续句
+    // （图内大段文字/表格行误报），合并失败走既有重试+降级，不劣于现状。
+    if (!/[.!?:;]\s*$/.test(frag.trim())) {
+      const lines = text.split('\n');
+      const first = (lines[0] || '').trim();
+      if (!/^[a-z]/.test(first)) {
+        const CAP_START = /^(figure|fig\.?|table)\s*\d+\b/i;
+        let i = 1, inCap = false, prev = first, found = -1;
+        for (; i < lines.length; i++) {
+          const ln = lines[i].trim();
+          if (!ln) continue;
+          if (inCap) { if (/[.!?]$/.test(ln)) inCap = false; prev = ln; continue; }
+          if (CAP_START.test(ln)) { if (/[.!?]$/.test(ln)) inCap = false; else inCap = true; prev = ln; continue; }
+          if (/^[a-z]/.test(ln) && ln.length >= 15) {
+            // v2.2.8.1 前行标点校验：真续句的上一个非空行要么以 .!? 收尾（正文句/图注块已结束），
+            // 要么是页首页眉行且不含句读（dila p7 页眉 "Disentangled Latent Action World Models" 后即真续句）。
+            // 多分部图注「(A)…(B)…(C)」中段就断句、后续图注行又小写长行开头（sage p3 "(B)" 部的
+            // "zt operates…"）会被前者拒掉；图内标签串（fla p14 "trajectory"/"controlledoriginal"——
+            // 小写且无标点）因前行非页眉被拒，扫描继续找真续句。
+            if (/[.!?]$/.test(prev) || (i === 1 && !/[.!?]/.test(prev))) { found = i; break; }
+            prev = ln; continue; // 疑似图注中段/标签行：不当候选，继续扫
+          }
+          prev = ln;
+        }
+        if (found > 0) {
+          console.log('[tr] 通用续句定位：frag 插到第 ' + (found + 1) + ' 行前（首个小写长行 + 前行标点校验，跳过图注块）');
+          return lines.slice(0, found).join('\n') + '\n' + frag.trim() + '\n' + lines.slice(found).join('\n');
+        }
       }
     }
   } catch (e) { console.log('[tr] 断词定位失败，回退头部并入:', (e && e.message) || e); }
