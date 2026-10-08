@@ -1690,6 +1690,7 @@ function rawGetAll(storeName) {
 async function syncPull() {
   const s = sbSession();
   if (!s) return;
+  sbLastPullAt = Date.now(); // v2.2.10：节流时间戳随每次拉取刷新
   const headers = sbHeaders(s.access_token);
   for (const { table, store: sn } of SYNC_TABLES) {
     let rows = [];
@@ -3403,6 +3404,10 @@ async function toggleTranslate(forceState) {
   if (turnOn) {
     if (!navigator.onLine) { toast('翻译需联网'); return; }
     if (!sbSession()) { toast('翻译需登录'); return; }
+    // v2.2.10：开翻译前先拉取。iOS PWA 从后台切回不重载页面，启动时的 syncPull 不会再跑，
+    // 本地没有其它设备刚推的译文缓存 → 点"翻译"从头重译（费钱+漏句），且新译文按 LWW
+    // updated_at 新者胜反把远端好版本覆盖劣质化（实测手机重译后 Mac 拉到劣质 p2）。
+    try { await syncPull(); } catch (e) { console.warn('pull(translate):', e.message); /* 拉取失败不挡翻译 */ }
     rs.tr = rs.tr || { enabled: false, pages: {}, done: 0, total: rs.numPages, cancelled: false };
     rs.tr.enabled = true;
     rs.tr.cancelled = false;
@@ -4482,6 +4487,15 @@ if ('serviceWorker' in navigator) {
 }
 
 // ===== 启动 =====
+// v2.2.10：回前台拉取（60s 节流）。iOS PWA 从后台切回不重载页面，启动时的 syncPull 不会再跑，
+// 队列/笔记/译文全程陈旧——手机上点"翻译"看不到 Mac 刚推的缓存就是此因（另有翻译开关前拉取兜底）。
+let sbLastPullAt = Date.now();
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !sbSession()) return;
+  if (Date.now() - sbLastPullAt < 60000) return;
+  sbLastPullAt = Date.now();
+  syncPull().catch((e) => console.warn('pull(visible):', e.message));
+});
 openDB()
   .then(async () => {
     renderAcct(); render();
