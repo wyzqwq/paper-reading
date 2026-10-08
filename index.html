@@ -3705,7 +3705,12 @@ function trPaintUnderlines(pageEl) {
     icon.dataset.pair = k;
     icon.title = '查看译文';
     icon.style.left = (lastRow.maxEnd - 4) + 'px';
-    icon.style.top = (lastRow.y + (lastRow.bottom - lastRow.y) / 2 - 7) + 'px';
+    // v2.2.11：垂直锚定从「矩形垂直中线」改「矩形底部 glyph 区」——textLayer span 矩形高常超行距
+    //（la p2 实测 h=30 行距 22.4），中线锚定使图标浮到句尾上一行、压前一行文字（用户报 p2 首句划线异常，
+    // 截图+像素级定位：下划线句间断口真实存在，视觉粘连感来自图标浮空横跨断口+压下一句首字母）。
+    // 底部锚定：图标底贴行底（下划线上方），矮矩形（<15px，紧排小字体）回退中线公式不劣化。
+    const rh = lastRow.bottom - lastRow.y;
+    icon.style.top = (rh >= 15 ? lastRow.bottom - 15 : lastRow.y + rh / 2 - 7) + 'px';
     icon.innerHTML = '<svg viewBox="0 0 14 14"><path d="M3 2 H9 L11 4 V12 H3 Z"/><path d="M9 2 V4 H11"/></svg>';
     layer.appendChild(icon);
   }
