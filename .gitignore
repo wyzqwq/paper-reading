@@ -14,6 +14,14 @@ logs/
 node_modules/
 *.swp
 .tmp/
+.dsh-office.*/
 
 # 大体积生成物（默认不进 git；如需提交单独 force-add）
 # results/
+outputs/
+.uv-cache/
+
+# 测试用论文原文（真机/真 API 验证的输入，非交付物）
+/BF00337259.pdf
+/dila.pdf
+/dreamdojo.pdf
