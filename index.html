@@ -3647,6 +3647,19 @@ function trApplyPage(pageNum) {
   trPaintUnderlines(pageEl);
 }
 
+// v2.2.12：片段是否属于旋转文字（竖排 arXiv 印章、图内旋转箭头）。
+// 旋转 span 的矩形是竖条（实测 CJ 论文首页印章 58×716），按「行底」画线会在页面空白处
+// 留一条悬空横线、图标也掉到那儿——这类片段一律不参与画线/图标（句子本身仍可点）。
+function trSpanRotated(el) {
+  const host = el.parentElement || el;
+  const tf = getComputedStyle(host).transform;
+  if (!tf || tf === 'none') return false;
+  const m = tf.match(/matrix\(([^)]+)\)/);
+  if (!m) return false;
+  const p = m[1].split(',').map(Number);
+  return Math.abs(p[1]) > 0.01 || Math.abs(p[2]) > 0.01;
+}
+
 // 画句内连续底线（overlay）：pdf.js 每词一 span，tr-sent 片段间有词间 gap，
 // border-bottom 会断续；改在 textLayer 上叠绝对定位层，按 data-pair 分组每行画一条 1px 线覆盖 gap。
 // layer insertBefore(endOfContent) 保持 endOfContent=lastChild（M7 reset 依赖）；reset 的 append(endOfContent) 也会自动维持顺序。
@@ -3662,6 +3675,7 @@ function trPaintUnderlines(pageEl) {
   const cRect = pageEl.getBoundingClientRect();
   const groups = new Map();
   sents.forEach((s) => {
+    if (trSpanRotated(s)) return; // v2.2.12：旋转文字（竖排印章/图内旋转箭头）不画线
     const k = s.dataset.pair;
     if (!groups.has(k)) groups.set(k, []);
     const r = s.getBoundingClientRect();
@@ -3684,27 +3698,45 @@ function trPaintUnderlines(pageEl) {
         hit.maxEnd = Math.max(hit.maxEnd, r.x + r.w);
         hit.y = Math.min(hit.y, r.y);
         hit.bottom = Math.max(hit.bottom, r.y + r.h);
+        hit.items.push(r);
       } else {
-        rows.push({ y: r.y, bottom: r.y + r.h, minX: r.x, maxEnd: r.x + r.w });
+        rows.push({ y: r.y, bottom: r.y + r.h, minX: r.x, maxEnd: r.x + r.w, items: [r] });
       }
     }
     for (const row of rows) {
-      const ul = document.createElement('div');
-      ul.className = 'tr-underline';
-      ul.dataset.pair = k;
-      ul.style.left = row.minX + 'px';
-      ul.style.top = (row.bottom - 1) + 'px';
-      ul.style.width = (row.maxEnd - row.minX) + 'px';
-      layer.appendChild(ul);
+      // v2.2.12：一行不再无条件画成一条贯通线——同一行内相邻片段间隙 > max(16px, 1.6×行高)
+      // 就断开（CJ 论文首页实测一句横跨正文栏+整张 Figure 1，间隙 151-425px，旧规则会直接横穿图/跨栏）。
+      // 词间 gap（3-9px）、作者名间 8.9px 间隙仍并成一条，不改变正常页面观感。
+      const splitGap = Math.max(16, (row.bottom - row.y) * 1.6);
+      const runs = [];
+      let curRun = null;
+      for (const it of row.items.slice().sort((a, b) => a.x - b.x)) {
+        if (!curRun) { curRun = { x: it.x, end: it.x + it.w }; continue; }
+        if (it.x - curRun.end > splitGap) { runs.push(curRun); curRun = { x: it.x, end: it.x + it.w }; }
+        else curRun.end = Math.max(curRun.end, it.x + it.w);
+      }
+      if (curRun) runs.push(curRun);
+      row.runs = runs;
+      for (const run of runs) {
+        const ul = document.createElement('div');
+        ul.className = 'tr-underline';
+        ul.dataset.pair = k;
+        ul.style.left = run.x + 'px';
+        ul.style.top = (row.bottom - 1) + 'px';
+        ul.style.width = (run.end - run.x) + 'px';
+        layer.appendChild(ul);
+      }
     }
     // P2：句尾图标 -- 末行（y 最大 = 视觉最后一行）右端放书页角小图标，单击弹该句译文。
     // v2.1.2：left 由 maxEnd+2 改 maxEnd-4（贴住标点，不再悬空）；下标已并进末行，中心不会掉到下标位置。
+    // v2.2.12：锚点跟着「最后一段线」的右端走（拆线后不会再落在大间隙中间/图里）。
     const lastRow = rows[rows.length - 1];
+    const lastRun = lastRow.runs[lastRow.runs.length - 1];
     const icon = document.createElement('div');
     icon.className = 'tr-icon';
     icon.dataset.pair = k;
     icon.title = '查看译文';
-    icon.style.left = (lastRow.maxEnd - 4) + 'px';
+    icon.style.left = (lastRun.end - 4) + 'px';
     // v2.2.11：垂直锚定从「矩形垂直中线」改「矩形底部 glyph 区」——textLayer span 矩形高常超行距
     //（la p2 实测 h=30 行距 22.4），中线锚定使图标浮到句尾上一行、压前一行文字（用户报 p2 首句划线异常，
     // 截图+像素级定位：下划线句间断口真实存在，视觉粘连感来自图标浮空横跨断口+压下一句首字母）。
